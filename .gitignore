@@ -1,0 +1,13 @@
+.env
+warehouse/*
+!warehouse/.gitkeep
+catalog/*
+!catalog/.gitkeep
+*.duckdb
+__pycache__/
+*.pyc
+.venv/
+target/
+logs/
+dbt_packages/
+.DS_Store

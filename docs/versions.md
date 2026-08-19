@@ -1,0 +1,57 @@
+# Versions (Phase 0)
+
+## Python toolchain
+
+- **Python 3.14.7** (system default via Homebrew, confirmed by `python3 --version`).
+- H0.4 required a compatibility probe before committing to this interpreter, because
+  3.14 is new enough that native-extension packages sometimes lack wheels.
+- Probe (dry-run only, nothing installed): `pip install --dry-run` against a scratch
+  venv on 3.14.7 for three package sets:
+  1. `pyiceberg[sql-sqlite,pyarrow] duckdb requests python-dotenv` — resolved cleanly,
+     pre-built `cp314` wheels found for every native package (`duckdb`, `pyarrow`,
+     `mmh3`, `pyroaring`, `pyiceberg-core`, `zstandard`, `sqlalchemy`).
+  2. `dbt-core dbt-duckdb` (Phase 2, resolution check only) — resolved cleanly.
+  3. `soda-core-duckdb` (Phase 3, resolution check only) — resolved, but pulls
+     `duckdb<1.1.0` and built that duckdb version from an sdist (`duckdb-1.0.0.tar.gz`,
+     no prebuilt wheel for it), rather than failing. Flagged below as a future
+     conflict, not a Phase 0 blocker.
+- **Outcome:** all three probes resolved without error → Python 3.14.7 was used as-is
+  for the project venv (`.venv/`). No fallback to 3.12 was needed.
+- **Known downstream risk (not actioned in Phase 0):** `soda-core-duckdb` 3.5.6 pins
+  `duckdb<1.1.0`, which directly conflicts with the `duckdb` 1.5.5 pinned here for
+  local dev. Phase 3 will need to resolve this — likely by installing Soda into a
+  separate venv/environment from the main dbt-duckdb one, since the two never need to
+  share a Python process. Recorded in `docs/decisions.md`.
+
+## Installed packages (`requirements.txt`, from `pip freeze`)
+
+Installed into `.venv` (Python 3.14.7) via:
+`pip install 'pyiceberg[sql-sqlite,pyarrow]' duckdb requests python-dotenv pyarrow`
+
+| Package | Installed version | Release date (if discoverable) | Why it matters |
+|---|---|---|---|
+| pyiceberg | 0.11.1 | 2026-03-03 | Core Iceberg table read/write library; the bronze layer's catalog and MERGE/upsert logic depend on it directly. |
+| pyiceberg-core | 0.7.0 | not independently checked (bundled native extension of pyiceberg) | Native (Rust) acceleration extension pulled in automatically by `pyiceberg`. |
+| duckdb | **1.5.5** | 2026-07-22 | Local read engine and dev loop. **On the 1.5+ line, not the 1.4 LTS line** — the partitioned-table UPDATE/DELETE restriction that exists on 1.4 LTS is lifted here. This matters for any local DuckDB-side mutation logic in later phases; PyIceberg still owns bronze writes regardless. |
+| pyarrow | 25.0.1 | 2026-08-10 | Arrow interop for pyiceberg reads/writes and Parquet I/O. |
+| requests | 2.34.2 | not checked | Socrata HTTP client for `scripts/verify_source.py` and later the ingest puller. |
+| python-dotenv | 1.2.3 | not checked | Loads `SOCRATA_APP_TOKEN` from `.env` without ever hardcoding it. |
+| sqlalchemy | 2.0.52 | not checked | Backing engine for pyiceberg's `SqlCatalog` (SQLite catalog). |
+| mmh3 | 5.2.1 | not checked | MurmurHash3 implementation pyiceberg uses for partition bucketing/hashing. |
+| pyroaring | 1.1.0 | not checked | Roaring-bitmap dependency pulled in by `pyiceberg[sql-sqlite]`. |
+| zstandard | 0.25.0 | not checked | Compression codec used by pyiceberg for metadata/Parquet. |
+| fsspec | 2026.7.0 | not checked | Filesystem abstraction pyiceberg uses under `pyarrow` extras. |
+| pydantic / pydantic_core | 2.13.4 / 2.46.4 | not checked | pyiceberg's config and schema validation models. |
+| click | 8.4.2 | not checked | CLI plumbing dependency of pyiceberg. |
+| rich | 14.3.4 | not checked | Console output formatting used by pyiceberg's CLI surface. |
+| strictyaml | 1.7.3 | not checked | pyiceberg catalog/config file parsing. |
+| tenacity | 9.1.4 | not checked | Retry logic inside pyiceberg. |
+| cachetools | 6.2.6 | not checked | Caching utility used by pyiceberg's catalog layer. |
+| certifi, charset-normalizer, idna, urllib3 | 2026.7.22 / 3.5.1 / 3.19 / 2.7.0 | not checked | Transitive `requests` dependencies (TLS, encoding). |
+| python-dateutil, six | 2.9.0.post0 / 1.17.0 | not checked | Transitive dependency of `strictyaml`. |
+| markdown-it-py, mdurl, Pygments | 4.2.0 / 0.1.2 / 2.21.0 | not checked | Transitive dependencies of `rich`. |
+| typing-extensions, typing-inspection, annotated-types | 4.16.0 / 0.4.4 / 0.8.0 | not checked | Transitive `pydantic` typing support. |
+
+Full pinned list with per-line rationale comments lives in `requirements.txt`. Not
+installed yet, per phase-0 scope: **dbt-core, dbt-duckdb, soda-core-duckdb** (Phases 2
+and 3 — dry-run resolution only, verified above, nothing installed to `.venv`).

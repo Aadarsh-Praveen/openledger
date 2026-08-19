@@ -1,0 +1,35 @@
+# Pinned exactly as resolved by `pip freeze` on 2026-08-19 against Python 3.14.7.
+# Do not hand-edit versions here; see docs/versions.md for the resolution/compat
+# probe behind each pin and docs/decisions.md for why Python 3.14.7 was chosen.
+
+annotated-types==0.8.0    # pydantic dependency
+cachetools==6.2.6         # pyiceberg[sql-sqlite] dependency
+certifi==2026.7.22        # requests dependency (TLS root certs)
+charset-normalizer==3.5.1 # requests dependency
+click==8.4.2               # pyiceberg CLI dependency
+duckdb==1.5.5              # local read engine for the Iceberg warehouse; 1.5+ line, see docs/versions.md
+fsspec==2026.7.0           # pyiceberg[pyarrow] filesystem abstraction
+idna==3.19                 # requests dependency
+markdown-it-py==4.2.0      # rich dependency (pyiceberg CLI output)
+mdurl==0.1.2                # markdown-it-py dependency
+mmh3==5.2.1                 # pyiceberg partitioning hash function
+pyarrow==25.0.1             # Iceberg table I/O and Arrow interop
+pydantic==2.13.4            # pyiceberg config/schema models
+pydantic_core==2.46.4       # pydantic dependency
+Pygments==2.21.0            # rich dependency
+pyiceberg==0.11.1           # Iceberg table format read/write, spec v2
+pyiceberg-core==0.7.0       # pyiceberg native extension
+pyparsing==3.3.2            # pyiceberg expression parsing dependency
+pyroaring==1.1.0            # pyiceberg[sql-sqlite] roaring-bitmap dependency
+python-dateutil==2.9.0.post0 # strictyaml dependency
+python-dotenv==1.2.3        # loads SOCRATA_APP_TOKEN from .env
+requests==2.34.2            # Socrata HTTP client
+rich==14.3.4                 # pyiceberg CLI output formatting
+six==1.17.0                  # python-dateutil dependency
+SQLAlchemy==2.0.52           # pyiceberg SqlCatalog (SQLite) backend
+strictyaml==1.7.3            # pyiceberg config file parsing
+tenacity==9.1.4              # pyiceberg retry logic
+typing-inspection==0.4.4     # pydantic dependency
+typing_extensions==4.16.0    # pydantic/pyiceberg typing backport
+urllib3==2.7.0                # requests dependency
+zstandard==0.25.0             # pyiceberg Parquet/metadata compression
