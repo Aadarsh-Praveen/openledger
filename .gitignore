@@ -3,6 +3,10 @@ warehouse/*
 !warehouse/.gitkeep
 catalog/*
 !catalog/.gitkeep
+raw/*
+!raw/.gitkeep
+state/*
+!state/.gitkeep
 *.duckdb
 __pycache__/
 *.pyc
