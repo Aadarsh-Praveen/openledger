@@ -531,28 +531,730 @@ against spike recurrence — see C1.3b for why it still isn't built.
   by cross-checking DQ output against expectations rather than trusting a "the
   pipeline ran successfully" result at face value.
 
-### C1.5 — partition-scoped upsert, measured against the real full-scale table
+### C1.5 — partition-scoped upsert: one mechanism, two measured consequences
 
-- **Measured:** with bronze at its final state (7,522,072 rows, 170 snapshots, 869
-  Parquet files across ~730 day-partitions), a real 500-row no-op batch (all
-  `created_date=2025-03-15`, already correctly present) was upserted twice: once
-  via PyIceberg's plain `table.upsert()` (unscoped — its match-scan is built purely
-  from a `unique_key IN (...)` predicate, with no partition awareness) and once via
-  `bronze.scoped_upsert()` (ANDs a `created_date` partition-range predicate into
-  the same scan).
-- **Result: unscoped 3.37s vs. scoped 0.09s — a 38.8x speedup**, on the real,
-  fully-populated table (not a small synthetic one — the effect is invisible on a
-  table with only a handful of partitions, which is why this was deferred until
-  bronze reached full scale rather than measured on the earlier smoke tests).
-- **Why:** the unscoped scan must consider manifests across all ~730 partitions to
-  find any file whose `unique_key` stats might match; the scoped scan prunes to the
-  1 partition (`2025-03-15`) the batch actually touches before ever evaluating
-  `unique_key`. This is the "real optimization with a number attached" phase-1.md
-  asked C1.5 to produce.
-- **Caveat:** this benefit is largest for backfill-style batches (chunked by
-  `created_date`, so `min(days)..max(days)` is tight — often a single day). It's
-  much weaker for `:updated_at`-chunked incremental batches, whose touched
-  `created_date` values can scatter across the entire 24-month range (a batch
-  spanning many partitions widens `scoped_upsert`'s partition-range predicate
-  toward the full table) — not measured separately here, but worth knowing before
-  assuming the 38.8x figure holds for every call site.
+**Corrected framing (per Gate 1 review):** the 38.8x scan speedup and the
+147.5x/11,419x write amplification (measured later, see the write-amplification
+entry below) are not two separate findings — they are the **same mechanism**
+viewed from its two sides. `scoped_upsert` ANDs a `created_date` partition-range
+predicate into the match scan. That predicate makes the **read/scan** side fast
+by pruning partitions before `unique_key` is ever evaluated (a real 38.8x on the
+full-scale table). But the underlying primitive it feeds — `table.overwrite()`
+— **rewrites at whole-partition granularity regardless of how few rows in that
+partition actually matched**: touching any partition, for any reason, causes
+every file in it to be deleted and rewritten. Narrowing the predicate can only
+ever help decide *which* partitions get touched — it cannot change *how much*
+of a touched partition gets rewritten, because that's fixed at "all of it."
+
+**Why backfill escapes the amplification side of this and incremental doesn't:**
+backfill batches are `created_date`-chunked, so a touched partition's rewrite is
+mostly *rows that were going to be written into that partition anyway* — write
+volume ≈ genuine content, amplification is invisible. Incremental batches are
+`:updated_at`-chunked, so `created_date` scatters across the full 24-month
+range within one batch; a handful of genuinely changed rows can each land in a
+*different* partition, and each of those partitions gets fully rewritten for
+that handful — write volume ≫ genuine content. Same mechanism, opposite
+outcome, entirely explained by which field the batch happens to be ordered/
+chunked on.
+
+- **Read-side measurement (scan speedup):** a real 500-row no-op batch (all
+  `created_date=2025-03-15`, already correctly present) against the full-scale
+  table (7,522,072 rows, 170 snapshots, 869 files, ~730 partitions): PyIceberg's
+  plain `table.upsert()` (unscoped, `unique_key IN (...)` only) took 3.37s;
+  `bronze.scoped_upsert()` (partition-range ANDed in) took 0.09s —
+  **38.8x faster**, because the unscoped scan must consider manifests across all
+  ~730 partitions while the scoped scan prunes to the 1 touched partition before
+  evaluating `unique_key` at all.
+- **Write-side measurement (amplification):** see the dedicated entry below —
+  147.5x and 11,419x rewrite amplification, measured on real production pages
+  from run 2, both driven by the same whole-partition-rewrite behavior.
+- **Consequence:** the predicate-narrowing optimization is real and large, but it
+  only ever pays off on the read side. Whether it's a net win depends entirely on
+  how concentrated the batch's `created_date` values are — tight for backfill
+  (wins big), scattered for incremental (can lose big). See the sub-chunking
+  measurement below for whether the write-side cost is avoidable.
+
+### Gate 1 human review: three corrections, resolved with real evidence
+
+Human review of the STOP GATE 1 report caught three problems. Investigated each
+against the actual Iceberg snapshot history and raw-landing file timestamps
+(ground truth, not reconstructed memory) rather than just accepting or restating
+the original claims.
+
+**Correction 1 — Criterion 7 is NOT proven; marked PARTIAL.** The watermark was
+seeded to `2026-08-18T01:22:36` with a 48h buffer, and the backfill ran through
+`2026-08-20T04:53:07` — so the first incremental query's window
+(`2026-08-16T01:22:36` to the `03:00`-anchored boundary) was a window the backfill
+had *already fully covered*. A 0-genuinely-new-row result was close to guaranteed
+by construction, not demonstrated against real new activity. The insert code path
+on the incremental route (different ordering field, chunking, and query
+construction from the backfill route) has only ever executed once — during run
+2, and only against the 4,340 out-of-scope stray rows (a bug artifact, not
+genuine new 2024+ activity; see the scope-leak entry above). **It has never been
+exercised against a genuinely new, in-scope row.** Recorded as PARTIAL in
+`docs/metrics.md`, both results kept side by side, not overwritten: idempotency
+proven (run 4: 0 updated, 0 inserted, 0 net growth, 100% no-op), insert path
+unproven. Re-test scheduled for ≥24h after the C1.6 backfill completed
+(2026-08-20T04:53:07 UTC), i.e. no earlier than 2026-08-21T04:53 UTC.
+
+**Correction 2 — criterion 11's snapshots, precisely identified.** The reported
+"real row-count difference via time travel" compared snapshot #163 (the last
+snapshot of the C1.6 backfill, `snapshot_id=4000161280114858559`, 7,522,072 rows,
+committed 2026-08-20T04:53:06.917Z) against what was then the *current* snapshot
+at the time the C1.8 script ran — snapshot #169 (`snapshot_id=2132395397023993280`,
+7,526,412 rows, committed 2026-08-20T05:12:05.148Z), i.e. **immediately after the
+buggy pre-fix incremental run 2, before the purge.** The difference (+4,340) is
+**entirely the scope-leak bug's insertion**, not genuine new activity — confirmed
+by the exact match to the bug's row count. This was a real, valid snapshot
+comparison (time travel correctly reflects a genuine — if buggy — committed
+write), but presenting it without stating which snapshots were compared implied
+it was evidence of legitimate incremental growth, which it was not. **A cleaner,
+currently-valid alternative exists in the same snapshot history**: snapshot #169
+(7,526,412, pre-purge) vs. snapshot #170 (`snapshot_id=3746702539029603816`,
+7,522,072, the `DELETE` operation that purged the 4,340 stray rows,
+2026-08-20T05:36:29.379Z) — a real, inspectable, **currently still valid** −4,340
+time-travel difference produced by the bug fix itself, arguably more interesting
+than an incremental-growth demo since it demonstrates time travel capturing a
+correction, not just an insertion. Going forward, criterion 11's authoritative
+evidence is **this delete-snapshot pair**, not the original insert-snapshot pair.
+
+**Correction 3 — the 546,445 finding, promoted to a real measurement.** See the
+dedicated entry below.
+
+**Snapshot accounting, 163 → 170, verified against the actual manifest history**
+(not reconstructed from memory — audited via `table.snapshots()` summaries and
+cross-referenced against `raw/` file mtimes):
+
+| Snapshots | Operation | Row delta | Attributed to |
+|---|---|---|---|
+| #164 | APPEND +234 | +234 | Run 2, page 1 of 12 (partial genuine matches within that page's key set) |
+| #165 | APPEND +4,106 | +4,106 | Run 2, a later page |
+| #166 | OVERWRITE +662,291 / −666,811 | −4,520 | Run 2 — see anomaly entry below |
+| #167 | APPEND +4,520 | +4,520 | Run 2, compensating append immediately after #166 |
+| #168 | OVERWRITE +11,418 / −11,419 | −1 | Run 2 — same anomaly, smaller instance |
+| #169 | APPEND +1 | +1 | Run 2, compensating append immediately after #168 |
+| #170 | DELETE −4,340 | −4,340 | The scope-leak purge |
+
+Sum of #164-#169: 234+4,106−4,520+4,520−1+1 = **+4,340**, exactly matching run 2's
+reported net growth. All 6 of these snapshots fall within run 2's actual
+wall-clock execution window (verified via `raw/` parquet file mtimes,
+2026-08-20T04:56:16Z–05:12:14Z) — **run 3 and run 4 (the post-fix run) each
+genuinely added zero snapshots**, matching what was originally reported for them.
+The only correction needed was attributing all 6 of run 2's snapshots correctly
+and understanding their *composition*, which was previously reported only as an
+aggregate "+6" without this detail.
+
+### Unexplained scoped_upsert anomaly during run 2 (verified harmless, root cause not fully confirmed)
+
+- **Discovered:** while auditing the snapshot history above, found two `OVERWRITE`
+  operations mid-run-2 that don't fit a simple mental model of `scoped_upsert`:
+  one replaced 666,811 existing rows with 662,291 rows in a single call, the other
+  replaced 11,419 with 11,418. Both were immediately followed (same or next
+  second) by a compensating `APPEND` restoring the missing count exactly (+4,520,
+  +1 respectively) — net zero across each pair.
+- **Why this is surprising:** `scoped_upsert`'s `rows_to_update` (the argument to
+  `table.overwrite()`) is derived via `upsert_util.get_rows_to_update(page,
+  existing, [join_col])`, which returns a subset of the *incoming page* — bounded
+  by the page size (≤50,000 rows, per `PAGE_SIZE`). A single page cannot logically
+  produce a 662,291-row `rows_to_update`. The likely trigger: run 2 is
+  `:updated_at`-chunked, so a single 50,000-row page's `created_date` values are
+  scattered across the full 24-month range rather than clustered — if even one or
+  two rows in a page fall in, say, May and June 2026, `partitions_touched()`
+  returns `min(days)..max(days)` spanning that entire range, and
+  `scoped_upsert`'s partition predicate widens to match. Why that would cause
+  `table.overwrite()` to report replacing 666,811 rows specifically (matching
+  the exact size of the May+June 2026 partitions) rather than just the actual
+  matched subset is **not fully understood** — a plausible but unconfirmed theory
+  is that PyIceberg's `overwrite()` resolves the delete side of the operation at
+  file granularity once `overwrite_filter`'s partition component is wide enough to
+  select those files, rather than purely by the row-level match predicate, and
+  the compensating append is `scoped_upsert`'s own not-matched-insert logic
+  correctly re-inserting whatever the overwrite didn't restore.
+- **Verified NOT a data-integrity problem, with real evidence:** May 2026 row
+  count = 331,978 (exact match to the known-correct kill/resume-test total), June
+  2026 = 334,833 (exact match), **zero duplicate `unique_key` values anywhere in
+  the 7,522,072-row table**, and an independent DuckDB `iceberg_scan` cross-check
+  matches PyIceberg's row count exactly. Whatever this mechanism is, it net out
+  to the correct final state both times it occurred.
+- **Consequence:** flagged as an open item, not resolved. `scoped_upsert`'s
+  behavior on `:updated_at`-chunked batches (where the partition-range predicate
+  can be arbitrarily wide relative to the actual matched-row count) should not be
+  fully trusted at larger scale without understanding this mechanism — it
+  happened to self-correct via the immediate compensating append both times
+  observed, but "happened to self-correct" is not the same as "verified correct
+  by design." Worth a deeper look before Phase 2, or before scaling incremental
+  run frequency/volume, even though it isn't blocking Gate 1 (data is verified
+  correct today).
+
+### C1.7d — the 546,445-row finding, with full arithmetic (promoted per Gate 1 review)
+
+- **The measurement:** the authoritative post-fix incremental run (run 4) queried
+  `:updated_at` from `2026-08-18T02:23:09.123Z` (the watermark then in effect,
+  itself already advanced by run 2/3, minus the 48h buffer) to
+  `2026-08-20T03:00:00Z` (the `03:00`-anchored boundary) — a span of **2 days,
+  0:36:51 ≈ 2.0256 days.**
+- **Expected volume at steady state:** ~11,905 rows/day (C1.1b's measured
+  baseline, excluding the known republish-spike outlier) × 2.0256 days ≈
+  **24,115 rows.**
+- **Observed volume:** **546,445 rows** — a ratio of **546,445 / 24,115 ≈ 22.7x**
+  expected steady-state volume for that window.
+- **No-op rate:** **100.00%** (0 rows updated, 0 rows inserted, 546,445 no-op) —
+  every single one of those 546,445 fetched rows was a `:updated_at` advance with
+  zero material field change relative to what bronze already held.
+- **Operational consequence:** every incremental run pays a real, sometimes
+  20x+-inflated **fetch/network cost** to apply what may be a small or zero number
+  of genuine changes, because the 48h buffer window overlaps the known Aug-19
+  republish event (a single-day, ~526,000-row batch touch, per C1.1b).
+- **Does this validate or undermine option (ii) (the pre-upsert diff-filter
+  design)?** **Validates the "build nothing" conclusion (C1.3b)**, but narrows
+  what it actually claims. The 22.7x volume inflation is entirely a **fetch-side**
+  cost — the API must be queried and the rows must be downloaded regardless of
+  what happens locally afterward, since Socrata's `:updated_at` field itself
+  advances broadly during a republish event and there is no way to distinguish
+  "genuinely changed" from "republish-touched" without fetching and comparing
+  values. A hand-rolled diff-filter would only ever reduce **local write** cost —
+  and C1.3b/this run both confirm that cost is already zero for no-op rows via
+  PyIceberg's built-in behavior. So: the decision to not build a diff-filter is
+  still correct (it wouldn't have helped with this specific cost), but it should
+  not be read as "incremental runs are cheap" — they can be fetch-expensive during
+  a republish window regardless of any local optimization.
+- **Honesty caveat, as instructed:** this is **one observation**, and the window
+  it covers directly overlaps the known Aug-19 republish spike — it may not
+  reflect steady-state incremental cost at all. This measurement will be repeated
+  on the criterion-7 re-test (≥24h after the backfill) and both results reported
+  side by side, not averaged or replaced.
+
+### Investigation: is the overwrite anomaly partition-level rewrite, and is it atomic? (Gate 1 follow-up)
+
+Human review correctly rejected my initial "widened predicate over scattered
+rows" theory: 666,811 is exactly the May+June 2026 backfill total — whole
+partitions being removed, not a row-count coincidence. Investigated per the
+five-step plan given, using real evidence at each step rather than continuing to
+guess.
+
+**1. Manifest audit — were ALL files in the touched partitions deleted, or a
+subset?** Printed the full snapshot summary properties (not just the
+top-level counts) for both anomalous snapshots:
+- Big overwrite: `added-data-files=73, deleted-data-files=73,
+  changed-partition-count=61, deleted-records=666811, added-records=662291`.
+  **61 = exactly the number of days in May+June 2026 (31+30).** Every file in
+  every one of those 61 partitions was rewritten.
+- Small overwrite: `added-data-files=1, deleted-data-files=1,
+  changed-partition-count=1, deleted-records=11419, added-records=11418`. One
+  partition (one day), its one file, fully rewritten.
+
+**2. Isolated reproduction — one row, one partition.** Built a 3-partition
+throwaway table (100 rows/day), then called `scoped_upsert` with a 2-row batch
+spanning day1 and day3 (skipping day2), where only 1 row (day1) was a genuine
+change and the other (day3) was byte-identical (no-op). Result: **day1's single
+100-row file was entirely deleted and rewritten with 99 rows, then a separate
+append added the 1 changed row back — net 100, correct.** Day2 (never in the
+batch) was untouched (100 rows, verified). Day3's file was never touched at
+all (its row was a no-op, correctly excluded from `rows_to_update`, so its file
+was never a delete/rewrite target). **This confirms: partition-level rewrite is
+triggered per-partition, only for partitions that actually contain a genuinely
+changed row — not swept broadly across the full min/max date span.** (My
+earlier "widened predicate" theory was wrong for a different reason than
+originally stated — it's not that unrelated partitions get swept in; it's that
+*any* partition containing even one changed row gets its *entire* file set
+rewritten, discarding nothing but reconstructing the whole thing.)
+
+**Mechanism, now fully understood by reading `Transaction.overwrite()`'s
+source:** it calls `self.delete(delete_filter=overwrite_filter, ...)` — Iceberg's
+delete resolves to a copy-on-write file rewrite when the filter can't be
+satisfied by whole-file drops, producing one snapshot (`OVERWRITE`: the touched
+file(s) minus the matched rows) — then, in a **separate** step, appends the
+caller-supplied replacement data (`df` = `rows_to_update`) as a second snapshot
+(`APPEND`). Both showed up as **two distinct snapshot IDs** in every case
+observed. Re-deriving the real bronze numbers with this understood: big case —
+`rows_to_update` was **4,520** rows (666,811 − 662,291, matching the
+compensating append's `+4,520` exactly); small case — `rows_to_update` was
+**1** row (matching its compensating append's `+1` exactly). Both fully
+consistent and now fully explained — no remaining mystery.
+
+**3. Write amplification, quantified from real production data (no synthetic
+benchmark needed — these are actual run-2 pages):**
+
+| Case | Rows genuinely changed | Rows rewritten (deleted+recreated) | Amplification |
+|---|---|---|---|
+| Big overwrite | 4,520 | 666,811 | **~147.5x** |
+| Small overwrite | 1 | 11,419 | **~11,419x** |
+
+This is severe, and it is specific to **`:updated_at`-chunked batches**, whose
+`created_date` values scatter across the full 24-month range within a single
+page — every genuinely-changed row can trigger a full rewrite of whatever
+partition it lands in, and if a batch happens to touch a changed row in each of
+61 different partitions, all 61 partitions get fully rewritten. This did NOT
+show up as a problem for **backfill** (`created_date`-chunked, one page's
+partition-range is always narrow — usually one or a few adjacent days), which
+is exactly where the 38.8x scoped-vs-unscoped speedup was measured. **The two
+regimes have opposite characteristics: `scoped_upsert`'s partition-scoping helps
+enormously for backfill and can badly hurt for incremental.** Likely explains
+why the incremental runs (589,388/550,567/546,445 rows fetched, only ~11-12
+pages each) took 900-1040 seconds — write cost from these amplified rewrites,
+not fetch time, plausibly dominates.
+
+**4-5. Durability — is the delete+append atomic, tested with a real kill.**
+Reproduced the exact scenario (1 changed row, 1 partition, 100-row file) on a
+fresh throwaway table, monkey-patching `Transaction.delete` to sleep 10 seconds
+immediately after it returns — i.e., right between the internal delete-rewrite
+commit and the internal append commit. Waited for a log marker confirming the
+delete step had run, then `kill -9`'d the process. **Result: the table showed
+exactly 1 snapshot afterward — the original pre-operation state. Zero rows
+lost, zero partial commit, id=0 still read "orig" (its pre-change value).**
+Ran the identical scenario to completion (no kill) as a control: it correctly
+produced 2 snapshots (OVERWRITE −100/+99, APPEND +1) and the final state was
+fully correct (100 rows, id=0 = "CHANGED").
+
+**Conclusion: `table.overwrite()` — and therefore `scoped_upsert` — IS ATOMIC.**
+Despite committing as two separate snapshots when successful, a crash anywhere
+during the call leaves the table in its exact pre-call state; there is no
+partially-committed, data-losing intermediate state reachable by a crash.
+**Per the pre-agreed framing: this is a documented write-amplification
+characteristic with a number attached, not an architecture-blocking bug.**
+Phase 2 does not need to wait for a fix here — but the write-amplification
+finding above means `scoped_upsert` should likely not be used as-is for the
+incremental path without reconsidering the chunking strategy (e.g., grouping
+an incremental batch by `created_date` sub-ranges before upserting, or falling
+back to plain unscoped `table.upsert()` for the incremental route specifically,
+since its match-predicate-only file selection doesn't provoke this
+partition-wide rewrite the same way). Left as a documented open consideration
+for Phase 2, not resolved here — the correctness and durability questions are
+answered; the performance-strategy question is not.
+
+**Partition-level row-count assertion — added, per instruction.** `bronze.py`'s
+`scoped_upsert()` now captures the touched partitions' total row count
+immediately before any write, and asserts (after both the overwrite and insert
+steps) that the post-write count equals `before + rows_inserted` exactly,
+raising loudly on any mismatch. This is the check that would have caught the
+original anomaly directly, without needing a manifest audit — verified against
+a legitimate update+insert case (200→201 rows, no false alarm).
+
+### Phase 2 strategy question, resolved by measurement: sub-chunking does NOT help
+
+Tested the hypothesis directly on the real bronze table, per instruction, rather
+than reasoning further from the isolated toy reproduction.
+
+**First attempt was confounded — caught before drawing a conclusion from it.**
+The first version of this test reused the *same* 60 rows across all three
+conditions (unscoped → mutate, scoped-bundled → mutate again, scoped-sub-chunked
+→ revert). Result looked dramatic — scoped-bundled and sub-chunked both showed
+**zero amplification** (60 rows rewritten for 60 changed) — but this was an
+artifact: the *first* test (unscoped) had already rewritten those partitions,
+splitting each touched row into its own small file via `overwrite()`'s
+append step. The second and third tests were then updating rows already
+isolated in tiny files, not fresh partitions — a fundamentally different, much
+cheaper case than the real production anomaly, which hit partitions untouched
+since the original backfill. Re-ran with three **disjoint** sets of 30 days
+each (90 distinct days total, verified zero overlap), so every test hits
+genuinely fresh, never-touched-since-backfill partitions — matching the real
+scenario.
+
+**Corrected results — 60 genuinely changed rows, scattered across 30 fresh
+partitions, for each of three strategies:**
+
+| Strategy | Elapsed | Rows rewritten | Amplification |
+|---|---|---|---|
+| Unscoped `table.upsert()`, bundled | 7.118s | 254,412 | 4,240x |
+| Scoped `scoped_upsert()`, bundled (as-is) | 8.729s | 260,168 | 4,336x |
+| Scoped `scoped_upsert()`, sub-chunked by `created_date` (30 separate calls) | 28.824s | 231,833 | 3,864x |
+
+**Sub-chunking does not help — reported plainly, per instruction.** The
+amplification is essentially identical across all three strategies (4,240x /
+4,336x / 3,864x — the ~11% spread is consistent with ordinary day-to-day
+partition-size variance across three different calendar periods, not a
+strategy effect). Sub-chunking is additionally **3-4x slower in wall-clock**
+(28.8s vs. 7-9s), because splitting one bundled call into 30 separate
+`table.overwrite()` calls multiplies per-call transaction/commit overhead
+(30×2=60 new snapshots vs. 2) without buying back any rewrite savings.
+
+**Why the hypothesis was wrong:** amplification is fixed **per touched
+partition**, not per batch-construction strategy. Whether 60 scattered
+changed rows arrive as one bundled call, one call per day, or an unscoped
+call, each of the 30 touched (fresh, never-modified) partitions still needs
+its entire file rewritten once *something* in it changes — that cost is
+determined by "was this partition ever touched before," not by "how was the
+incoming batch grouped when it was touched." Sub-chunking cannot reduce it
+because it doesn't change *which* partitions get touched, only how many
+separate transactions do the touching (which only adds overhead).
+
+**Unscoped is not worse here either — also reported plainly.** For this
+kind of large-amplification batch, unscoped `table.upsert()` was
+*slightly faster* than scoped (7.1s vs. 8.7s) and had comparable rewrite
+volume. This makes sense in light of the unified C1.5 framing above: scoping's
+benefit is entirely on the read/scan side, and when write cost from
+unavoidable partition rewrites dominates (as it does here), the scan-side
+saving becomes a rounding error next to it.
+
+**What would actually help (not measured, out of scope here):** the
+amplification is inherent to Iceberg's copy-on-write semantics for
+`overwrite()` — an update to any row in an untouched partition forces a full
+file rewrite regardless of how the calling code batches its requests. A real
+fix would need to change the *write mode* itself — e.g. merge-on-read
+(positional/equality delete files instead of file rewrites, the same mode
+Athena's Iceberg support already assumes per CLAUDE.md's known traps) — not
+how `scoped_upsert` groups its input. Left as an open question for whoever
+picks up the incremental-write-strategy work next; not resolved or adopted
+here, since the measured evidence doesn't support adopting sub-chunking and no
+alternative was implemented or tested.
+
+**Bronze integrity after testing:** all 238 distinct `unique_key`s touched
+across both the confounded and corrected experiments were reverted to their
+original `descriptor` values via a final scoped upsert. Verified: 0 mismatches
+against original values, total row count exactly 7,522,072 (unchanged).
+
+### README-bound finding (flagged so it isn't lost before Phase 7)
+
+**"Partition-scoped upsert rewrote 11,419 rows to change 1"** — the mechanism
+(copy-on-write `overwrite()` rewrites entire touched partitions regardless of
+how few rows match), the measured numbers (147.5x and 11,419x amplification in
+production; 4,240x-4,336x reproduced and quantified on a controlled 60-row/
+30-partition test; 38.8x scan speedup as the other side of the same
+mechanism), the durability finding (proven atomic via a real kill-mid-operation
+test — no data loss, full rollback), and the negative result (sub-chunking
+doesn't help, tested and quantified) together are the strongest engineering
+narrative in the project so far: a real anomaly, root-caused from first
+principles (source code reading + isolated reproduction), quantified, proven
+safe, and an intuitive mitigation tested and honestly reported as not working.
+**Phase 7's README must include this finding, with the mechanism, the numbers,
+and the durability proof** — not just the headline number.
+
+### Criterion-7 re-test attempt 1: same-window repeat, not a design gap
+
+Ran `run_incremental()` at 2026-08-20T17:33 UTC (~12.5h after the backfill, short
+of the originally-stated 24h threshold). Result was **bit-for-bit identical** to
+the prior post-fix run: 546,445 fetched, 0 updated, 0 inserted, 100% no-op, 0 row/
+snapshot delta. Traced the cause: `run_incremental`'s `query_end =
+_anchor_boundary(now)` rounds down to the most recent `03:00` UTC boundary. Since
+"now" hadn't crossed into `2026-08-21T03:00Z` yet, `query_end` resolved to the
+exact same `2026-08-20T03:00Z` as the previous run, and the watermark hadn't
+moved either (nothing to advance it to) — so the query window was identical, not
+just similarly-shaped.
+
+**This is correct behavior, not a bug — corrected per human review after an
+initial mischaracterization.** Boundary anchoring exists specifically so
+incremental windows align to the *source's actual publish cycle* (the observed
+~daily batch stamp, ~01:33-02:03 UTC) rather than to an arbitrary wall-clock
+duration. An identical same-day window is the **expected, correct** outcome
+when no new publish cycle has occurred since the last run — the mechanism is
+working as designed, not failing.
+
+**The real lesson is about the re-test threshold, not the code:** the
+originally-stated "≥24h after the backfill" was the wrong criterion. **The
+correct threshold is "after the next publish cycle" — i.e., after
+`2026-08-21T03:00Z`, whenever that specific boundary is next crossed — not a
+fixed 24-hour clock duration.** This distinction matters beyond this one
+re-test: **it should govern how Phase 6's cron schedule is set.** A schedule
+that fires on a fixed interval without regard to the publish-cycle boundary
+risks the same outcome recurring in production — a scheduled run that
+queries an already-fully-covered window, burns the fetch cost, and reports
+"0 new rows" in a way indistinguishable from "the watermark mechanism is
+broken." Phase 6 should schedule incremental runs to trigger *after* the
+`03:00` UTC boundary each day (with some margin, e.g. `03:15`), not on an
+arbitrary cadence relative to when the previous run happened to execute.
+
+### PROPOSAL (not implemented, awaiting approval) — no-op short-circuit for same-window runs
+
+Investigated per instruction; **not implemented in code**. Design:
+
+Before `run_incremental()` does anything expensive (the `count()` call and the
+page-fetch loop), compare the freshly-computed `(query_start, query_end)`
+against the `start`/`end` recorded on the most recent completed
+`incremental_*` checkpoint entry. If both match exactly, log
+`"No new publish cycle since last run (window unchanged: [{query_start},
+{query_end})) — skipping fetch."` and return a zero-cost result immediately
+(`rows_fetched=0`, etc.) without calling `count()` or `paginate()` at all.
+
+**Why this is safe:** `query_start` is derived from the stored watermark (which
+only ever advances forward when genuine new activity is found) and
+`query_end` from the `03:00`-anchored boundary (which only advances once a day
+crosses that boundary). If *both* are unchanged from the last completed run,
+no new data could possibly exist in a query that scans that exact same range
+again — Socrata's dataset doesn't retroactively remove `:updated_at` stamps
+that were already there. This isn't a heuristic; it's a direct consequence of
+the watermark/boundary design already in place.
+
+**Why NOT implemented without approval:** it changes observable behavior (a
+same-window re-run currently still performs a real fetch and reconciles
+against `count()`, which is itself a form of freshness confirmation — with the
+short-circuit, that confirmation goes away for skipped runs). Also interacts
+with the checkpoint label collision noted earlier (same-day incremental runs
+share one checkpoint entry, overwriting each other) — the short-circuit's
+"most recent completed entry" lookup should be checked against that limitation
+before relying on it. Worth doing, but a design decision, not an obvious
+patch.
+
+### Criterion-7 re-test methodology, extended (per Gate 1 review)
+
+Two additions for the next actual re-test (after `2026-08-21T03:00Z`):
+1. **Report watermark before and after**, and confirm it actually advances to
+   the value implied by whatever new `:updated_at` maximum is observed. The
+   watermark-advance code path (`checkpoint.save_watermark()` inside
+   `run_incremental`, guarded by `max_watermark_seen > watermark_dt`) has never
+   executed for real — it's been static since the C1.6 backfill seeded it,
+   because every run since has found nothing newer. A watermark that silently
+   fails to advance would look *identical* to "no new data" indefinitely, and
+   nothing so far has distinguished those two cases.
+2. Continue reporting the republish-noise ratio against the 22.7x baseline, and
+   state plainly whether the new measurement looks like steady state or another
+   republish artifact — this is now genuinely a fresh measurement once the
+   window actually changes.
+
+### Checkpoint labeling defect — fixed, with the short-circuit built on top
+
+Human review flagged this as its own defect, separate from the short-circuit
+approval: `run_incremental`'s checkpoint label was `f"incremental_{query_end
+.date().isoformat()}"` — one label per **calendar day**, not per **run**. Any
+second same-day invocation (which already happened today — the identical
+runs at 2026-08-20T13:33 and the earlier post-fix run) silently overwrote the
+prior run's checkpoint record. This destroys run history and — critically —
+would have made the short-circuit's "compare against the most recent entry"
+lookup read an unreliable, already-overwritten record.
+
+- **Fixed:** `label = f"incremental_{datetime.now(timezone.utc).strftime(
+  '%Y%m%dT%H%M%S%f')}"` — timestamped to the microsecond at call time, unique
+  per invocation regardless of how many runs happen in one calendar day or
+  even one calendar second.
+- **Added:** `checkpoint.get_latest_incremental_entry()` — scans all
+  `incremental_*`-labeled entries (complete or skipped), returns the one with
+  the latest `completed_at`/`skipped_at`/`started_at`, by label prefix so it
+  naturally excludes backfill's `YYYY-MM`-labeled entries.
+- **Verified by running twice**, per instruction: first call correctly found
+  the old pre-fix `incremental_2026-08-20` entry as "most recent," recognized
+  an identical window, short-circuited, and wrote a new distinct record
+  (`incremental_20260820T185109918200`). Second call found *that* record as
+  most recent, also matched, also short-circuited, and wrote a third distinct
+  record (`incremental_20260820T185109925821`). **Three distinct entries now
+  exist** where before there would have been one, repeatedly overwritten.
+
+### No-op short-circuit — implemented, loud by design
+
+Implemented in `run_incremental`, gated on checkpoint labeling being fixed
+first (as instructed). Before any network call: compute `(query_start,
+query_end)`, compare against `get_latest_incremental_entry()`. On an exact
+match: log at **WARNING** (not INFO, not silent) with the precise repeated
+window bounds and the reason, write a checkpoint entry with
+`status="skipped_no_new_window"` (its own status, distinguishable from a
+completed run that genuinely fetched and found nothing), and return a
+zero-cost result — no `count()` call, no `paginate()`, none of the ~546k-row
+fetch cost a repeat window would otherwise burn for zero benefit.
+
+**Alerting threshold for Phase 6, reasoned now while the context is fresh:**
+**alert on 3 consecutive short-circuits.** Important distinction, recorded so
+it isn't conflated later: this is a **scheduling-integrity** signal, not a
+**source-staleness** signal, even though both were raised in the same review
+comment.
+- Under a *correctly*-configured Phase 6 cron (fires once daily, after the
+  `03:00` UTC boundary), `query_end` differs every single day by construction
+  — the short-circuit should essentially never fire in steady-state
+  operation. Any occurrence at all is already slightly unexpected.
+- **N=1**: could be an innocuous one-off — a manual re-run, a retry after a
+  transient failure in the same cycle. Not alert-worthy alone.
+- **N=2**: still plausibly a one-off double-fire.
+- **N=3 in a row**: very unlikely to be coincidental — strongly indicates a
+  systematic problem (cron interval misconfigured shorter than the publish
+  cycle, or a clock/deployment issue preventing `now` from ever crossing the
+  boundary). This is the right point to page.
+- **What this metric does NOT catch — a separate metric is needed for
+  source staleness.** A short-circuit only fires when the window is
+  *identical* to before. A run that genuinely fetches on schedule (window
+  correctly advanced) but finds zero real inserts is a normal completed run
+  with 0 net growth — not a short-circuit, and the counter above stays at 0
+  regardless of whether the *source* has actually gone quiet. Detecting that
+  (informed by the 2.53-92 day observed publish lag from C1.1) needs its own
+  Phase 6 metric — e.g. "days since watermark last advanced due to a genuine
+  change" compared against the ~92-day worst-case tail — not derived from the
+  short-circuit counter. Flagged here as a distinct Phase 6 requirement, not
+  designed or implemented now.
+
+### Criterion 9 headline evidence #2: 4,521 rows genuinely updated by run 2 — why incremental ingestion is necessary, proven concretely
+
+Promoted out of the snapshot-accounting table per Gate 1 review — this is the
+clearest demonstration in Phase 1 of the actual problem incremental ingestion
+solves, and it deserves its own entry, not a buried aggregate. **Timeline
+below is rebuilt from verified UTC sources only** (checkpoint `started_at`/
+`completed_at` fields and `snapshot.timestamp_ms`, both genuine UTC in this
+codebase) — not from log-file timestamps, which use local system time and
+caused a mislabeling earlier in this phase. This corrects the initial
+paraphrase of this finding (which conflated the Aug-19 01:33 republish event
+with the actual correction-triggering event — close, but the real story is
+more precise and, if anything, more compelling):
+
+| Event | UTC time | What happened |
+|---|---|---|
+| Republish/batch-stamp event | 2026-08-19T01:33:23.553Z | Touches ~526,651 rows dataset-wide (the C1.1b/C1.9 spike). Both May and June 2026 backfill windows later report this as their `watermark_high` — the newest touch visible *as of the backfill pull*. |
+| Backfill pulls May 2026 | 2026-08-20T01:22:36 – 01:25:25Z | 331,978 rows landed, reflecting each row's state as of this pull. |
+| Backfill pulls June 2026 | 2026-08-20T01:26:26 – 01:30:22Z | 334,833 rows landed, same-day pull, immediately after May. |
+| **A same-day (Aug 20) batch cycle touches specific rows with genuine field changes** | sometime in 2026-08-20T01:30:22–03:00:00Z (inferred — falls inside run 2's query window, after the backfill pull, before the window's upper bound) | **This is the race**: the live source changed some May/June rows' content *after* the backfill had already pulled and committed them, and *before* the day's `03:00Z` incremental-window boundary. |
+| Run 2 fetches and corrects | 2026-08-20T05:11:18 – 05:12:05Z | Two update pairs: `OVERWRITE` −666,811/+662,291 then `APPEND` +4,520 (net: 4,520 rows genuinely updated in May/June partitions); `OVERWRITE` −11,419/+11,418 then `APPEND` +1 (1 more row, a different single-day partition). **4,520 + 1 = 4,521 rows total, genuinely corrected.** |
+
+**Why this is the clearest proof, not just an accounting curiosity:** the
+backfill is `created_date`-chunked and captures each row's state *at the
+moment its window is pulled* — it has no way to know if that row changes
+again five minutes, or five hours, later, because the backfill's own
+execution (~53 minutes wall-clock) is itself a window during which the live
+source keeps moving. **This is exactly the concurrent-with-backfill race
+condition the watermark-seeding design (earliest window `started_at` minus
+the 48h buffer, from the earlier Gate-1-caught correction) was built to
+guard against — and here is direct, measured proof it happened for real**,
+not a hypothetical. Without the incremental route (and without seeding its
+watermark from before the backfill's own start, not from the backfill's
+observed data), these 4,521 rows' updated field values — the actual outcome
+of whatever changed for those specific 311 requests on 2026-08-20 — would
+have been silently and permanently missed. This is criterion 9's headline
+evidence, standing alongside `unique_key=68857791`'s Open→Closed proof:
+`68857791` shows a single row's correct MERGE update in isolation; this
+shows the *systemic reason* the incremental route exists at all, at real
+scale (4,521 rows, two separate partitions, a genuine live-source race).
+
+### Snapshot retention and file accumulation — investigated, not implemented
+
+Per instruction: report only. Measured live against the real bronze table.
+
+**(a) Current state.** 300 snapshots. 2,843 physical `.parquet` data files on
+disk, 907.6 MB. Of those, only **1,050 files (716.3 MB) are referenced by the
+current snapshot** — the other **1,793 files (191.3 MB) are superseded**:
+physically present, but not part of any live query, kept only because nothing
+has ever removed them. (Sanity-checked: every file the current snapshot
+references was confirmed present on disk — 0 missing.) Metadata directory
+(manifests, manifest-lists, `metadata.json` history): 1,013 files, 38.1 MB —
+also strictly growing, one set per snapshot, forever.
+
+**(b) Disk delta attributable to superseded files since the backfill.** C1.6
+measured 731 MB immediately after the backfill (163 snapshots, no test
+churn yet). Current total: 907.6 MB data + 38.1 MB metadata = 945.7 MB — a
+**+214.7 MB delta**. Of that, **191.3 MB (89%) is superseded data files**;
+the remaining ~23 MB is metadata growth plus a small net change in the
+current view's own file layout from the amplification/sub-chunking tests.
+**Essentially all of Phase 1's post-backfill disk growth is retention debt,
+not genuine new data** — genuine new data (the C1.7 net row growth) was 0 by
+the time of this measurement.
+
+**(c) Projected growth at one scheduled run/day.** Two framings, both
+caveated — there is no real steady-state measurement yet (criterion 7 is
+still PARTIAL):
+- **Using the one real "genuine changes found" event we have** (run 2's
+  4,521-row correction, which rewrote 678,230 rows: 666,811 + 11,419): at the
+  current measured **99.9 bytes/row** footprint, that's **~64.6 MB of new
+  superseded data per event.** If Phase 6 ran once daily and *every* day
+  looked like this one, that's **~23.6 GB/year of pure retention debt** —
+  more than 32x the entire current dataset's live size. This is very likely
+  an overestimate (run 2's event was a one-time backfill-race correction,
+  not demonstrated steady state), but it's the only real number available,
+  and it establishes the order of magnitude is not negligible.
+- **Bound by partition count instead:** each partition averages
+  7,522,072 ÷ ~730 ≈ 10,304 rows. If a normal day's genuine changes touch,
+  say, 30-100 distinct partitions (the range explored in the sub-chunking
+  test), that's roughly 309K-1.03M rows rewritten/day ≈ 31-103 MB/day —
+  broadly consistent with the run-2-based estimate, not contradicting it.
+- **Bottom line: without compaction, superseded-file growth is very
+  plausibly faster than genuine data growth**, by a wide margin, given the
+  measured amplification factors (147.5x-11,419x production, 4,240x-4,336x
+  controlled). This needs real Phase 6 operational data to pin down
+  precisely, but the order of magnitude is already clear enough to plan
+  around now rather than discover in Phase 7.
+
+**(d) What PyIceberg actually supports locally — verified empirically, not
+assumed.** `Table.maintenance.expire_snapshots()` exists
+(`ExpireSnapshots.by_id()` / `.by_ids()` / `.older_than(dt)` /
+`.commit()`). Read its `_commit()` implementation directly: it issues exactly
+one `RemoveSnapshotsUpdate` — **it only removes entries from the snapshot
+log in `metadata.json`. It does not delete any data file, manifest file, or
+manifest-list file from disk.** Searched the entire installed `pyiceberg`
+package for `remove_orphan_files`, `rewrite_data_files`, `compact_data`, or
+any garbage-collection utility: **none exist.** `MaintenanceTable`'s only
+method is `expire_snapshots`. **This directly confirms the instruction's
+caution was warranted — Athena's `OPTIMIZE`/`VACUUM` semantics (which do
+physically compact and reclaim space) do not apply to local PyIceberg 0.11.1
+at all.** Running `expire_snapshots()` locally would shrink the *logical*
+snapshot log (and thus how far back time travel reaches) without freeing a
+single byte of the 191.3 MB already superseded on disk — actual space
+reclamation would require a **hand-rolled orphan-file sweep** (compute the
+set of files referenced by any *surviving* snapshot after expiration, diff
+against everything on disk, delete the difference) — not provided by the
+library, would need to be written from scratch, and was not implemented here
+per instruction.
+
+**(e) Proposed retention policy (not implemented) — must preserve criterion
+11's evidence.** `ManageSnapshots.create_tag(snapshot_id, name)` exists and
+is honored by `expire_snapshots()`: tagged (and branch-HEAD) snapshots are
+automatically excluded from any expiration, by ID or by `older_than(dt)` —
+confirmed by reading `_get_protected_snapshot_ids()`. Proposed shape, for
+Phase 2 or later to actually adopt:
+1. **Tag the criterion-11 evidence explicitly** — `#169`
+   (`snapshot_id=2132395397023993280`) and `#170`
+   (`snapshot_id=3746702539029603816`), e.g. `"phase1-c1.9-pre-purge"` and
+   `"phase1-c1.9-post-purge"` — so they survive any future expiration
+   regardless of age, by design rather than by accident.
+2. **Expire by age for everything else** — e.g. `older_than(now - 30 days)`,
+   run periodically (Phase 6 cron, alongside the incremental job) once real
+   operational cadence is known.
+3. **Add the hand-rolled orphan-file sweep** as its own maintenance step,
+   *after* `expire_snapshots()` commits — since (d) confirmed expiration
+   alone does not reclaim disk space, a retention policy that stops at step 2
+   solves the metadata-log growth but not the actual disk-growth problem
+   this investigation was about.
+4. Not decided here: the exact age cutoff, sweep frequency, or whether other
+   specific snapshots (beyond #169/#170) deserve tags — left for whoever
+   implements this, informed by real Phase 6 volume once available.
+
+**Phase 7 consequence, flagged as instructed:** the S3 mirror and Athena
+scan-cost planning are sized on **731 MB** (C1.6's post-backfill measurement).
+If no compaction/retention policy runs between now and Phase 7, and if
+superseded-file growth tracks anywhere near the (c) projections, bronze could
+be **many times that size in superseded files alone** by the time it's
+mirrored to S3 — meaning both the mirror's storage cost and Athena's
+bytes-scanned estimates (if Athena's own Iceberg reads ever touch
+non-current files, e.g. during time-travel queries) would be sized on stale
+assumptions. A retention/compaction policy should exist and run *before*
+Phase 7's mirror, not be designed at mirror time.
+
+### Criterion 7/8/11 final re-test — run after the boundary genuinely passed (2026-08-21)
+
+Confirmed via `date -u` (2026-08-21T14:23:58Z) before running, avoiding the
+same-window mistake from the prior attempt. Full numbers in
+`docs/metrics.md`'s C1.7 table (run 6 / run 7). Summary:
+
+- **Run 6** (real fetch, `skipped=False`): 559,540 fetched, 522,213 updated,
+  **11,060 inserted**, 26,267 no-op. Row count grew by exactly 11,060.
+  Watermark advanced `2026-08-20T02:23:09.123Z` → `2026-08-21T02:49:13.094Z`
+  — verified via a live `$group` query that this equals the actual maximum
+  `:updated_at` in the fetched batch, not an arbitrary value. Partition-level
+  assertion held throughout (zero exceptions across a run touching many
+  partitions with genuine inserts and updates) — its first real exercise on
+  non-synthetic data.
+- **Characterized the 522,213 "updated" rows directly, not assumed**: 99.997%
+  (522,196) share one exact timestamp, `2026-08-21T01:33:31.100Z` — the same
+  ~01:33 UTC daily signature seen on Aug 19 (526,605-row spike) and Aug 20
+  (~13,537-row regular touch). **This is a recurring republish pattern, not a
+  one-time anomaly** — three consecutive days now show a batch touch at the
+  same time-of-day, with wildly varying magnitude (13.5K, 522K). The 11,060
+  genuine inserts are cleanly distinguishable from this (spread across many
+  distinct `:updated_at` values, consistent with organic new-row creation at
+  roughly the expected ~7,900/day rate given the backfill's own cutoff).
+- **Republish-noise ratio, fresh measurement**: 15.5x (vs. the original
+  22.7x) — both measurements now on record, both dominated by the same
+  recurring republish pattern. Two data points, same qualitative conclusion:
+  incremental-run fetch volume is not "small" in the naive sense whenever a
+  daily batch touch lands inside the query window, which given the observed
+  ~daily cadence is often.
+- **Run 7** (immediate follow-up): 545,988 fetched, 0 updated, 0 inserted,
+  100% no-op, 0 row/snapshot delta. Proves idempotency *after* genuinely
+  absorbing new content — the gap the original run 3/4 pair left open (those
+  only proved idempotency when nothing had changed at all, per the first
+  Gate 1 correction).
+
+**All three load-bearing/flagged criteria now PASS on their own stated
+conditions:**
+- **Criterion 7**: idempotency proven (run 7) and insert path proven (run 6,
+  non-zero insert count, row count grew by exactly that amount) — both
+  halves of the original pass condition satisfied.
+- **Criterion 8**: third-run-adds-≈-zero proven against fresh activity (run
+  7 following run 6), not just against a static no-op window.
+- **Criterion 11**: three independent real snapshot-diff demonstrations on
+  record (#169→#170 delete; pre/post-run-6 insert; the 4,521-row update
+  evidence), none contingent on a bug-fix narrative to be valid evidence.
+
+No contingency needed: inserts did not come back zero, so the "determine
+whether the publish cycle has run" fallback instruction doesn't apply here —
+it clearly had, and the evidence shows it.

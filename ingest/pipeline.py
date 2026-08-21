@@ -199,8 +199,37 @@ def run_incremental():
     order_clause = f"{WATERMARK_FIELD},{ORDER_TIEBREAKER}"
     select_clause = schema.select_clause()
 
+    # No-op short-circuit: if this run's window is IDENTICAL to the most recent
+    # incremental run's window (both query_start and query_end unchanged), no
+    # new publish cycle has occurred since — the watermark only advances on
+    # genuine new activity, and query_end only advances once the 03:00 UTC
+    # boundary is crossed, so a repeat window cannot contain new data. This is
+    # NEVER silent: logged at WARNING with the exact repeated bounds, and
+    # recorded as its own checkpoint entry (status=skipped_no_new_window) — a
+    # quiet skip would be indistinguishable from a stalled pipeline, and with
+    # a 2.53-92 day publish lag, staleness is exactly what can't be caught by
+    # inspection otherwise. See docs/decisions.md for the alerting threshold
+    # this feeds into for Phase 6.
+    window_start_iso = query_start.isoformat()
+    window_end_iso = query_end.isoformat()
+    latest = checkpoint.get_latest_incremental_entry()
+    if latest is not None and latest.get("start") == window_start_iso and latest.get("end") == window_end_iso:
+        reason = (
+            f"Window [{window_start_iso}, {window_end_iso}) is identical to the most recent "
+            f"incremental run ({latest['label']}) — no new publish cycle since then."
+        )
+        log.warning(f"SHORT-CIRCUIT: skipping incremental run. {reason}")
+        skip_label = f"incremental_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}"
+        checkpoint.mark_window_skipped(skip_label, window_start_iso, window_end_iso, reason)
+        return {
+            "rows_fetched": 0, "rows_updated": 0, "rows_inserted": 0, "rows_no_op": 0,
+            "max_watermark_seen": None, "skipped": True,
+        }
+
     expected_count = socrata_client.count(where_clause)
-    label = f"incremental_{query_end.date().isoformat()}"
+    # Unique per run (timestamp + microseconds) so same-day re-runs accumulate
+    # distinct checkpoint records instead of overwriting each other's history.
+    label = f"incremental_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}"
     checkpoint.mark_window_started(label, query_start.isoformat(), query_end.isoformat())
 
     pages = socrata_client.paginate(where_clause, order_clause, select_clause)

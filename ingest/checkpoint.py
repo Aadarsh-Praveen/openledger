@@ -74,6 +74,41 @@ def mark_window_complete(window_label, rows_fetched, expected_count, watermark_h
     save_checkpoint(state)
 
 
+def mark_window_skipped(window_label, window_start, window_end, reason):
+    """Record a short-circuited run — never silent. A skipped run still gets a
+    full checkpoint entry (status=skipped_no_new_window) so run history shows
+    it happened, distinct from a run that genuinely fetched and found nothing."""
+    state = load_checkpoint()
+    state["windows"][window_label] = {
+        "start": window_start,
+        "end": window_end,
+        "status": "skipped_no_new_window",
+        "reason": reason,
+        "skipped_at": datetime.now(timezone.utc).isoformat(),
+    }
+    save_checkpoint(state)
+
+
+def get_latest_incremental_entry():
+    """Most recent incremental-route checkpoint entry (complete or skipped),
+    by its started_at/skipped_at timestamp — used by the no-op short-circuit
+    to compare against the last run's actual window bounds. Backfill's
+    month-labeled ("YYYY-MM") entries are excluded."""
+    state = load_checkpoint()
+    candidates = []
+    for label, w in state["windows"].items():
+        if not label.startswith("incremental_"):
+            continue
+        ts = w.get("completed_at") or w.get("skipped_at") or w.get("started_at")
+        if ts:
+            candidates.append((ts, label, w))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: c[0])
+    _, label, w = candidates[-1]
+    return {"label": label, **w}
+
+
 def load_watermark():
     if not WATERMARK_PATH.exists():
         return None

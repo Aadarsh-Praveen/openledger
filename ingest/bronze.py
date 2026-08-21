@@ -93,6 +93,14 @@ def scoped_upsert(table, arrow_table, join_cols=("unique_key",)):
 
     rows_to_update = upsert_util.get_rows_to_update(arrow_table, existing, [join_col])
 
+    # Partition-level row-count assertion (added after the H1.1/Gate-1 review
+    # found table.overwrite() can rewrite every file in a touched partition range
+    # — up to 11,419x write amplification for a single changed row, observed in
+    # production. This check would have caught that anomaly immediately, without
+    # needing a manifest audit: any row-count drift in the touched partitions,
+    # for any reason, fails loudly here rather than silently.
+    partition_count_before = len(table.scan(row_filter=partition_predicate).to_arrow()) if len(rows_to_update) > 0 else None
+
     updated = 0
     if len(rows_to_update) > 0:
         overwrite_filter = And(partition_predicate, upsert_util.create_match_filter(rows_to_update, [join_col]))
@@ -111,5 +119,18 @@ def scoped_upsert(table, arrow_table, join_cols=("unique_key",)):
     if len(rows_to_insert) > 0:
         table.append(rows_to_insert)
         inserted = len(rows_to_insert)
+
+    if partition_count_before is not None:
+        table.refresh()
+        partition_count_after = len(table.scan(row_filter=partition_predicate).to_arrow())
+        expected_after = partition_count_before + inserted
+        if partition_count_after != expected_after:
+            raise RuntimeError(
+                f"PARTITION ROW-COUNT ASSERTION FAILED for days {days}: "
+                f"before={partition_count_before}, after={partition_count_after}, "
+                f"expected={expected_after} (before + inserted={inserted}). "
+                f"Touched partitions may have lost or gained rows unexpectedly — "
+                f"see docs/decisions.md write-amplification/atomicity findings."
+            )
 
     return {"rows_updated": updated, "rows_inserted": inserted}
