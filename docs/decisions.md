@@ -1258,3 +1258,438 @@ conditions:**
 No contingency needed: inserts did not come back zero, so the "determine
 whether the publish cycle has run" fallback instruction doesn't apply here —
 it clearly had, and the evidence shows it.
+
+## Phase 2
+
+### C2.1 — dbt→DuckDB→Iceberg read path: verified, direct reads recommended
+
+- **Installed:** `dbt-core` 1.12.3, `dbt-duckdb` 1.11.0, pinned from actual
+  resolution (matches the Phase 0 dry-run probe). `duckdb` stayed at 1.5.5 —
+  dbt-duckdb's `duckdb>=1.0.0` constraint didn't force a change.
+- **Tested in a throwaway project** (not the real `dbt/` scaffold — that's
+  C2.2, gated behind H2.1 approval): a minimal `profiles.yml` with
+  `extensions: [iceberg]` and `settings: {unsafe_enable_version_guessing:
+  true}`, and one model doing `select count(*) from iceberg_scan('<bronze
+  root>', allow_moved_paths => true)`.
+- **Result: works cleanly.** `dbt run` created the view without error;
+  `dbt show` (a genuinely fresh CLI invocation, fresh connection) returned
+  **7,533,132** — an exact match to bronze's known row count. Confirmed the
+  `iceberg` extension load and the `unsafe_enable_version_guessing` setting
+  both persist correctly through dbt-duckdb's connection handling, across
+  separate dbt invocations, not just within one long-lived process.
+- **Performance measured, both scan types:**
+  - Full-table `count(*)`: 0.088s. Partition-pruned `count(*)` (one month):
+    0.061s. Both near-instant — DuckDB satisfies a bare count from Iceberg
+    manifest-level statistics without touching Parquet data.
+  - **Full-table materialization of every column** (the realistic cost a
+    staging model actually pays): **54.2s** for all 7,533,132 rows.
+  - **Fallback comparison** (PyIceberg/DuckDB export to a single Parquet
+    file, then read that): export itself cost 9.5s; reading the exported
+    Parquet back (all columns) cost 41.6s. **Not dramatically faster** — a
+    ~23% reduction on the read side, and that's before even counting the
+    export step's own 9.5s, which would need to repeat before every dbt run
+    unless done on a separate, staler cadence.
+- **Recommendation: keep direct Iceberg reads. Do not build the Parquet-export
+  fallback.** The performance gap is real but modest (not the "dramatically
+  slower" threshold phase-2.md asked about), and direct reads preserve the
+  "dbt reads Iceberg directly" claim without adding a materialization step,
+  an extra scheduled job, or a staleness window between bronze and what dbt
+  sees. If the 54.2s full-materialization cost becomes a real dev-loop
+  friction point once more models exist, the first lever to pull is
+  partition-pruned staging (only re-read changed partitions), not switching
+  away from direct reads entirely.
+- **Not yet decided (deferred to C2.2/H2.1 approval):** the exact mechanism
+  for defining bronze as a dbt **source** vs. hand-writing `iceberg_scan(...)`
+  in every model. This throwaway test used a raw SQL model to isolate the
+  read-path question cleanly; C2.2's actual scaffold needs to decide the
+  cleanest way to expose this (a source with a custom scan macro, or a
+  staging-layer convention) — a scaffolding decision, not a read-path one.
+- **Stopping for H2.1 approval, per instruction** — no modeling begins until
+  the human approves this read-path choice.
+- **H2.1: APPROVED (direct reads, no fallback).** Three follow-up additions
+  from the approval, addressed in C2.2 below.
+
+### C2.2 — dbt project scaffold, and the three H2.1 follow-up additions
+
+- **Scaffold:** `dbt/` with `models/{staging,intermediate,marts}`, `macros/`,
+  `tests/`, `seeds/`, `analyses/`. Self-contained `profiles.yml` in the
+  project directory (not `~/.dbt/`) for reproducibility — invoke as `cd dbt
+  && dbt <command> --profiles-dir .`, not `--project-dir dbt` from the repo
+  root (found empirically: dbt-duckdb resolves the profile's `path:` setting
+  relative to the process's cwd, not `--project-dir`, so the two invocation
+  styles aren't interchangeable — pick one convention and stick to it).
+
+**Addition 1 — bronze as a dbt SOURCE with a scan macro.** Implemented with
+one real constraint discovered along the way: dbt-duckdb's
+`SourceConfig.external_location` (`relation.py`) renders its Jinja in a
+context where **custom project macros are not yet in scope** — a
+`{{ bronze_iceberg_scan() }}` call there failed with "macro is undefined"
+(verified directly, not assumed). `{{ var(...) }}` calls **do** resolve
+there, since vars are core Jinja context, not a project-macro lookup. Final
+design: `dbt_project.yml` holds `bronze_warehouse_root` as the one place the
+actual filesystem path lives; `models/staging/_sources.yml`'s
+`meta.external_location` inlines `iceberg_scan('{{ var("bronze_warehouse_root")
+}}', allow_moved_paths => true)`; `macros/bronze_scan.sql` defines the
+equivalent expression as a real, callable macro for any future ad-hoc
+analysis that needs the same scan outside a dbt-source context (where macro
+calls work normally). Both read the same one var, so there remains exactly
+one place to change the path — the "one macro" framing from the review
+comment is satisfied in spirit (one source of truth) even though the literal
+macro isn't invoked from inside the source YAML, for the structural reason
+above. Verified end-to-end: `dbt run --select _smoke_test_source` (a
+temporary throwaway model, deleted after verification, per C2.2's own scope —
+staging is C2.4) returned **7,533,132** via `{{ source('bronze',
+'service_requests') }}`, exact match to bronze's known count.
+- **`dbt source freshness` verified working**, the concrete Phase 6 payoff
+  this design was for: `loaded_at_field: updated_at`,
+  `warn_after: {count: 3, period: day}`, `error_after: {count: 10, period:
+  day}` — provisional thresholds informed by C1.1/C1.1b's measured lag
+  (2.53-day floor, 6.71-day median, up to 92-day tail): tighter than the
+  median so real slowdown surfaces early, looser than the median to avoid
+  paging on ordinary variance, well inside the 92-day tail either way.
+  Ran `dbt source freshness` live: **PASS** (max `updated_at` is recent,
+  from run 6). Revisit these thresholds with real Phase 6 operational data
+  before trusting them in production alerting.
+
+**Addition 2 — dev-time row limit, target-aware project var.**
+`dev_row_limit` in `dbt_project.yml`'s `vars:`, set via
+`"{{ 90 if target.name == 'dev' else none }}"`. Verified empirically with a
+temporary debug macro (removed after verification) that `target.name` **is**
+available when `dbt_project.yml`'s vars are rendered (not guaranteed in all
+dbt versions/contexts, so this was checked rather than assumed): `dbt
+run-operation ... --target dev` resolved `dev_row_limit=90`; `--target prod`
+resolved `dev_row_limit=None`. The var is defined now (C2.2); it isn't
+*applied* anywhere yet — that's C2.4's staging model, which will filter to
+the most recent `dev_row_limit` days of `created_date` when the var is set,
+and read unfiltered when it's null. Switching targets is purely a `--target`
+flag change, never an edited model, per the instruction.
+
+**Addition 3 — Phase 7 benchmark baselines captured now.** Recorded in
+`docs/metrics.md` with the environment (Apple M3 Pro, 18 GB RAM, arm64,
+macOS 15.7.3, DuckDB 1.5.5, dbt-duckdb 1.11.0) alongside, and with the
+count-only queries explicitly flagged as **zero-bytes-scanned metadata reads**
+— Athena has no equivalent free path for the same query, so Phase 7's
+comparison must report bytes-scanned and dollar cost alongside latency, not
+latency alone, or the comparison is unfair by construction.
+
+**Cleanup:** the smoke-test model and debug macro were both temporary,
+created to verify specific claims empirically and deleted immediately after.
+`.user.yml` (dbt's local anonymous-usage-tracking ID, created because
+`--profiles-dir .` pointed dbt's user-config lookup at the project directory
+too) added to `.gitignore` — not project source.
+
+### C2.3 — Proposed observation cutoff: 30 days
+
+**Proposal: `observation_cutoff_days = 30`.** A row is `is_settled` only if
+`created_date <= (max available created_date - 30 days)`, independent of its
+current open/closed status. This is a temporal trust boundary, not a
+closure-status one — a row can be `is_settled=true` and still open (a
+genuine, trustworthy censoring case) or `is_settled=false` regardless of what
+bronze currently shows for it (too recent to trust either reading).
+
+**Reasoning, against the actual measured distribution** (C1.1: 2.53-day
+floor, 6.71-day median, up to 92-day tail):
+- **30 days is ~4.5x the median lag (6.71 days)** — comfortably clears the
+  typical case with real margin, not just barely past it. Most genuine
+  closures that are going to be reflected promptly will be reflected well
+  before this boundary.
+- **30 days is roughly 1/3 of the 92-day tail** — this is a deliberate,
+  stated trade, not an oversight. **No finite cutoff shielded by the 92-day
+  tail is achievable without discarding nearly three months of the most
+  analytically interesting (most recent) data.** A cutoff at 30 days accepts
+  a residual: some small fraction of requests older than 30 days will still
+  have a late-arriving closure update beyond that point, and their
+  `is_settled=true` classification will turn out to have been premature. This
+  is a real, quantifiable cost — not eliminated, just bounded and disclosed —
+  and C2.8's real measurements (closure rates, censored counts) will surface
+  its actual size rather than leave it theoretical.
+- **30 days is one calendar month** — a legible, easily communicated unit for
+  a dashboard's "last N days excluded from resolution-time metrics" framing,
+  which matters since this cutoff is an analytical judgment call the human
+  audience (not just downstream code) needs to understand and trust.
+- **Distinct from, and compounding on top of, the already-handled censoring
+  problem.** `is_censored` (genuinely still-open) and `is_settled` (recent
+  enough that even a "closed" reading might not be final) are two separate
+  axes — a resolution-time metric should require *both* `is_closed=true` and
+  `is_settled=true` to be trusted; the mart computes `resolution_hours` as
+  null whenever either condition fails, never a zero or imputed value (per
+  C2.5's explicit requirement).
+
+**Not proposed:** a cutoff at the 6.71-day median (too much of the
+distribution's mass still resolves after that point — a materially high
+false-settled rate) or at the 92-day tail (technically safest, but discards
+enough recent data to defeat the project's own stated purpose — a dashboard
+that draws the eye to exactly the period it would have to exclude).
+
+**Recorded as the project variable** `observation_cutoff_days` in
+`dbt/dbt_project.yml` (currently `null`, placeholder pending approval — will
+be set to `30` once H2.2 clears, not hardcoded in any model).
+
+**Stopping for H2.2 approval, per instruction.** `int_request_resolution`
+will not be built until this is approved.
+- **H2.2: APPROVED at 30 days.** One follow-up requirement: measure the
+  actual settlement curve directly (not inferred from C1.1's lag
+  distribution — a different quantity, see below) before building
+  `int_request_resolution`.
+
+### C2.3 follow-up — measured settlement curve, cutoff revised to 45 days
+
+**Why this is a different measurement from C1.1.** C1.1 measured
+`closed_date`-to-`:updated_at` lag (2.53d floor, 6.71d median, 92d tail) —
+the delay between a closure happening and it becoming visible. The
+observation cutoff needs *created_date*-to-observable time — how long after
+a request is filed until its eventual closure (whenever that closure
+happens) is visible — which also folds in however long the underlying
+resolution itself took. These are genuinely different quantities; inferring
+one from the other would have been a real gap, correctly caught.
+
+**Method:** for each of several fully-settled creation cohorts,
+`date_diff('day', created_date, updated_at)` on every currently-closed row
+gives, per row, days-until-observable directly from data already in bronze
+— no need to reconstruct historical API snapshots.
+
+**A real methodological trap was hit and diagnosed, not glossed over.**
+First attempt used 2024/2025 cohorts (per the review comment's own
+suggestion) and returned **0.00% completeness at every threshold up to 90
+days** — an implausible result investigated immediately rather than
+reported at face value. Root cause: the December 2025 migration (Phase 1's
+finding) bulk-touched `:updated_at` for effectively the whole pre-existing
+dataset, so for any row whose genuine closure predated that migration,
+`updated_at` reflects the *migration's* timestamp, not the original
+observability moment — 481 days after creation for a September 2024 sample,
+confirmed directly. **Cohorts were redrawn from 2026 (Jan-Apr)** — old
+enough by Aug 2026 to clear the 92-day tail, but created after the Dec 2025
+migration, so this specific contamination doesn't apply to them.
+
+**A second, smaller contamination found and excluded, not blended in.**
+January 2026 showed 26.9% of its closed rows (91,010 of 338,952) sharing one
+exact `updated_at` — `2026-08-20` — distinct from the broader Aug 19-21
+recurring pattern documented earlier this phase. Checked whether Feb/Mar/Apr
+show the same issue: they show only 0.10-0.24% touched by any recent-spike
+window — negligible. January is reported in `docs/findings.md` for
+completeness but **excluded from the cutoff conclusion**, since it's
+identifiably contamination, not signal. Flagged as its own candidate finding
+for Phase 3 (a plausible one-off administrative backlog sweep on ~7-month-old
+cases) — related to, but distinct from, C2.8's bulk-closure hypothesis.
+
+**Result (clean cohorts, Feb/Mar/Apr 2026, full table in
+`docs/findings.md`):**
+
+| N | 2026-02 | 2026-03 | 2026-04 | Average |
+|---|---|---|---|---|
+| 30d | 85.45% | 85.23% | 87.25% | **86.0%** |
+| 45d | 92.06% | 92.98% | 93.92% | **92.99%** |
+| 90d | 97.29% | 98.27% | 98.97% | 98.18% |
+
+**At 30 days: ~86% — materially below the ~90% threshold specified for
+"well justified."** Per the pre-agreed decision rule, this is a revision
+case, not a confirmation case.
+
+**Revised: `observation_cutoff_days = 45`.** Clears ~93% consistently
+across all three clean cohorts (92.06-93.92%, a tight range — not a noisy
+or marginal pass). Updated in `dbt/dbt_project.yml`, replacing the
+placeholder `30` that was never actually committed to the project var (H2.2
+approved the *concept* at 30; this measurement was required before building
+anything on it, and changed the number before it was ever used). Still an
+explicitly disclosed trade against the 92-day tail (98% at 90 days, not
+100%) — no finite cutoff is risk-free, this one is now evidence-backed
+rather than inferred.
+
+**`is_settled` confirmed to key on `created_date`, not `closed_date`, per
+the explicit check requested.** Keying on `closed_date` would exclude
+exactly the slow-resolving/still-open requests the cutoff exists to
+account for: an open row has no `closed_date` at all, so it could never be
+marked settled regardless of true age (permanently "too recent" no matter
+how long it's been open); a row that *just* closed would get
+`closed_date ≈ now` and pass a recency-based settledness check immediately —
+inverting the correction, treating the least trustworthy reading (a
+just-happened closure, likely still subject to revision/lag) as the most
+trustworthy. `created_date`-keying correctly makes "old enough since
+creation" the trust signal, independent of current status, which is what
+lets a long-open row be a confident, genuine censoring case rather than an
+indefinitely-untrusted one.
+
+### C2.4 — Staging: three ambiguities resolved by direct measurement
+
+- **`latitude`/`longitude` vs `location_lat`/`location_lon`**: 100.0000%
+  agreement (7,403,755 of 7,403,755 rows where both pairs are present, within
+  0.0001° / ~11m) and always both-present-or-both-null together (0 rows with
+  only one pair populated). `latitude`/`longitude` kept as canonical
+  (simpler names, no GeoJSON-derivation step); the `location_*` pair dropped
+  entirely past staging as fully redundant.
+- **Coordinate validity**: a `has_valid_coordinates` boolean flag, never a
+  row filter, per phase-2.md — out-of-bounds is 0% (confirmed again here)
+  but missing reaches ~1.7% in this table snapshot, so presence/absence is
+  the only real distinction worth flagging.
+- **`resolution_action_updated_date`**: kept in staging, not bronze-only —
+  real analytical value (a source-side "last resolution update" signal used
+  as the C1.8 cross-check field in Phase 1) and no reason to hide it.
+- **Casing normalization, checked field-by-field rather than applied
+  blanket-uniformly**: `borough`, `status`, `agency`, `open_data_channel_type`,
+  `park_borough` all showed zero case-insensitive variants (verified, not
+  assumed) and were left with only `trim()`. `city`, `complaint_type`, and
+  `descriptor` showed real variants (`'NY'/'ny'/'Ny'`, `'Plumbing'/'PLUMBING'`,
+  `'Elevator'/'ELEVATOR'`) and were normalized to uppercase, matching the
+  schema's otherwise-dominant convention. This matters concretely for
+  `dim_complaint_type`'s grain — without normalizing, case variants would
+  have counted as distinct dimension members.
+- **Timezone assumption operationalized, not just documented**: naive
+  timestamp columns are localized via `timezone(var('created_date_timezone'),
+  ...)` in staging — the one place phase-2.md's problem #3 asks for — proving
+  along the way that DuckDB's `timezone()` is DST-aware (EST in January, EDT
+  in July, verified directly), resolving Phase 1's "DST-awareness unverified"
+  open question.
+
+### C2.5 — Intermediate: `int_request_resolution` and `int_request_geography`
+
+- **`int_request_resolution`** implements exactly the three-flag design
+  phase-2.md specifies: `is_closed` (status='Closed' AND closed_date not
+  null — status alone isn't sufficient given the known "Closed, null
+  closed_date" defect), `is_settled` (created_date old enough per the
+  measured 45-day cutoff — keyed on created_date, confirmed correct above),
+  `is_censored` (NOT is_closed OR NOT is_settled). Verified directly: querying
+  all four (is_closed, is_settled) combinations shows `resolution_hours`
+  populated in *exactly* the is_closed=true/is_settled=true cell and null in
+  all three others — the C2.9 test target, already true before the test is
+  even written. The rare closed-before-created defect (~0.02-0.03%) is left
+  un-suppressed in `resolution_hours` (produces a negative value) rather than
+  nulled out separately — hiding it would mask exactly the finding C2.9's
+  `closed_date >= created_date` test is designed to surface.
+- **`int_request_geography` — borough vs park_borough resolved by direct
+  measurement**: 100.00% agreement across 7,526,843 non-Unspecified rows,
+  and identical null/Unspecified pattern in exactly the same 6,289 rows
+  (0.08%) for both — not a park-complaint-specific field with sparser
+  coverage as the name suggests, just a duplicate. `borough` kept, `
+  park_borough` dropped.
+- **`community_board` used directly as the location key**, not re-derived:
+  format "NN BOROUGH" (e.g. "12 BRONX"), 77 distinct raw values, 0 nulls,
+  with graceful "Unspecified BOROUGH" / "0 Unspecified" fallbacks — this
+  already *is* phase-2.md's "borough + community district," combined.
+  Splitting and rejoining it would only reconstruct the same string with
+  more chances to disagree with the source's own encoding.
+
+### C2.6/C2.7 — Dimensions, and a real grain-violation bug caught and fixed
+
+- **Dimensions**, Type 1, `row_number()`-keyed surrogates (no external
+  package dependency added for this): `dim_agency` (16 members, agency ->
+  agency_name verified 1:1, no drift), `dim_complaint_type` (202 distinct
+  `complaint_type` values, 1,278 distinct (complaint_type, descriptor) pairs
+  — a real ~6.3-descriptor-per-type hierarchy, descriptor null 0.33% of the
+  time and preserved as a genuine null, never coalesced into a placeholder
+  string in the displayed attribute), `dim_location` (keyed on the full
+  (community_board, borough) pair — see below for why both, not
+  community_board alone), `dim_date` (one row per day, 2024-08-19 through
+  2027-12-31, 1,230 rows, includes season derived from month for the
+  compositional-seasonality question C2.8 asks).
+- **A real grain violation was caught and fixed before it reached tests,
+  not discovered by them.** `fct_service_requests`'s first build showed
+  1,024,548 total rows for only 982,790 distinct `unique_key`s — a fan-out.
+  Root cause: `dim_location`'s declared grain is the pair
+  `(community_board, borough)`, but the fact table's join initially matched
+  on `community_board` alone. Investigated directly: **646 rows have a
+  genuinely inconsistent `community_board`/`borough` pairing in the source**
+  — 645 rows with `community_board='08 BRONX'` but `borough='MANHATTAN'`,
+  1 row with `community_board='01 QUEENS'` but `borough='BRONX'` — meaning
+  `dim_location` legitimately has 2 borough values for each of those two
+  community_board strings, and joining on community_board alone matched
+  both. **Fix: join on the full (community_board, borough) pair**, matching
+  what `dim_location`'s grain actually is — not a workaround, the original
+  join was simply incomplete relative to the dimension's own declared key.
+  Verified after the fix: 982,790 = 982,790, zero null FKs across all four
+  dimensions. **The underlying 646-row inconsistency itself is a real data
+  quality finding**, worth carrying into Phase 3's DQ scorecard — a small
+  but genuine source-data defect distinct from anything found in Phase 0/1.
+
+### C2.8 — Five analytical questions, answered against the full prod build
+
+Full findings and tables in `docs/findings.md`. Two are worth flagging here
+because they surfaced new data-quality/interpretation nuance beyond what
+the question asked for:
+
+- **Agency SLA**: EDC (49.6% closure) and TLC (70.5% closure) stand out
+  not as slow agencies but as agencies where a large share of settled
+  requests never reach `status = 'Closed'` in this dataset at all. Flagged
+  as a Phase 3 DQ question (do these agencies close out-of-band, e.g. in a
+  system that doesn't sync `status` back?) rather than reported as a
+  literal "half of EDC's requests are abandoned" finding.
+- **Geographic equity**: found two distinct shapes, not one. HEAT/HOT WATER
+  shows a median-level gap (Bronx/Staten Island ~36-37h vs.
+  Brooklyn/Manhattan/Queens ~44-46h). NOISE - RESIDENTIAL shows a
+  same-median-worse-tail pattern instead — Bronx's p90 (12h) is 2-3x every
+  other borough's (4-6h) while medians are all ~1-2h. A median-only SLA
+  dashboard would completely hide the second pattern; both are reported.
+- **Bulk-closure hypothesis**: fully confirmed and total, not partial —
+  all 11,372 of the 2024 `Closed`+null-`closed_date` rows share one
+  `:updated_at` date (2025-12-26), 99.9% belong to DHS, and 94% carry one
+  of two DHS mobile-outreach template resolution texts. A single
+  administrative bulk-closure sweep, not scattered data entry gaps.
+- **Geocoding-lag hypothesis**: the naive framing (monotonic rise = lag)
+  was falsified by the data — the spike is at March 2026, five months
+  before the most recent data, which a genuine "hasn't caught up yet" lag
+  cannot produce. Traced instead to a real compositional effect: NYC's
+  known spring pothole surge inflates STREET CONDITION's volume ~5-6x in
+  March-April, and STREET CONDITION chronically has a far higher
+  missing-coordinate rate (21-46%) than the dataset overall (1.72%) because
+  it's commonly reported by street segment rather than a point location.
+  The dataset-wide rate rises and falls with STREET CONDITION's share of
+  monthly volume, not with any change in per-type geocoding behavior. This
+  is the kind of wrong-initial-hypothesis-caught-by-measurement finding
+  CLAUDE.md's standing rules exist to surface rather than paper over.
+
+### C2.9 — Tests and model contracts
+
+- **A real bug caught by writing contracts, not by inspection**:
+  `dim_date.date_key` was typed `TIMESTAMP`, not `DATE` — DuckDB promotes
+  `date + interval` to `TIMESTAMP` — while `fct_service_requests.date_key`
+  is `DATE` (`cast(created_date as date)`). The two would still join
+  correctly today via implicit cast, but a declared model contract can't
+  paper over a type mismatch, and leaving it would have made the
+  `relationships` test's declared `field: date_key` a lie about the actual
+  types on both sides. Fixed by casting the date spine back to `DATE`
+  explicitly in `dim_date.sql`, with a comment explaining why the cast is
+  necessary rather than redundant. This is exactly the kind of thing model
+  contracts are supposed to surface early — caught here, in Phase 2, not
+  discovered by a downstream BI tool silently coercing types in Phase 5.
+- **Model contracts enforced on all four dimensions and the fact table**
+  (not staging/intermediate, per phase-2.md), with every column typed
+  explicitly. No `dbt_utils` or other package dependency added — every test
+  here is either a core dbt generic test (`unique`, `not_null`,
+  `relationships`) or a hand-written singular SQL test in `tests/`, since
+  the full minimum list in phase-2.md doesn't require anything a package
+  would add, and adding one mid-phase for two tests wasn't worth the extra
+  dependency surface.
+- **`assert_resolution_hours_null_when_censored`** — hard error, zero
+  tolerance. Unlike the closed/created defect below, there is no known
+  legitimate reason for this to ever fail; it's the direct proof of STOP
+  GATE 2's load-bearing criterion 5.
+- **`assert_closed_date_after_created_date`** — deliberately configured to
+  **warn**, not error, and to warn on `>0`: this test is *designed* to show
+  a small number of failures every run (1,763 rows / 7,289,995 with a
+  `closed_date`, ≈0.0242% in the full prod build — matching the ~0.02%
+  rate already documented from Phase 1). `error_if: '>3500'` is the real
+  assertion: it only escalates to a hard failure if the defect rate roughly
+  doubles, which would mean something new and undiagnosed broke, distinct
+  from the known Phase-1-documented defect. Verified this design works as
+  intended in both targets: prod run shows `WARN 1763`, dev run (recent
+  ~90-day slice) shows `WARN 354` — same underlying rate, proportionally
+  smaller count, neither anywhere near the error threshold.
+- **`assert_staging_reconciles_to_bronze`** — target-aware by necessity,
+  not convenience: dev's `dev_row_limit` sampling means staging *should*
+  differ from bronze's full count there, so the test no-ops in dev
+  (`select 1 where false`) and does the real comparison only in prod, where
+  it confirms exact equality (7,533,132 = 7,533,132).
+- **Result**: `dbt build --target prod` → 5 table models, 3 view models, 42
+  data tests, **49 PASS / 1 WARN (as designed) / 0 ERROR**, full run
+  (models + tests) in **~10-12s**. Same shape in dev (49 PASS / 1 WARN / 0
+  ERROR), confirming the target-aware tests behave correctly in both
+  environments rather than just happening to pass in one.
+- **Complaint-type dimension count correction**: while re-measuring for
+  this section, `dim_complaint_type` came back as 202 distinct
+  `complaint_type` values / 1,278 distinct pairs, not the 206/1,280 recorded
+  in the C2.6/C2.7 entry above — corrected there and in the model's own
+  comment/schema description. Bronze's total row count is unchanged
+  (7,533,132), so this reflects underlying field values shifting via
+  upstream MERGE/upsert activity between measurements, not a row-count
+  change — a reminder that dimension cardinality in an actively-updated
+  source isn't a one-time-measured constant, and any hardcoded row-count
+  comment here is a snapshot, not a guarantee.

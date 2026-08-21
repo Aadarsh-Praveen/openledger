@@ -1,0 +1,66 @@
+name: openledger
+version: "1.0.0"
+config-version: 2
+profile: openledger
+
+model-paths: ["models"]
+analysis-paths: ["analyses"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+
+clean-targets: ["target", "dbt_packages"]
+
+models:
+  openledger:
+    staging:
+      +materialized: view
+    intermediate:
+      +materialized: view
+    marts:
+      +materialized: table
+
+vars:
+  # Absolute path to the bronze Iceberg table's root directory. Single-developer
+  # local project (consistent with ingest/config.py's own ROOT-relative absolute
+  # paths) — update this if the repo is ever moved or cloned elsewhere. Used by
+  # macros/bronze_scan.sql, the one place the iceberg_scan()/version-guessing/
+  # table-root quirk lives (see docs/decisions.md, C2.2).
+  bronze_warehouse_root: "/Users/aadarsh_praveen/Documents/Projects/Personal_Projects/OpenLedger/openledger/warehouse/bronze/service_requests"
+
+  # Dev-time row limit: applied only in staging (C2.4), never bakes into the
+  # source definition itself. Value is a day count: the small recent slice
+  # to use when running against the dev target.
+  #
+  # NOTE on how target-awareness is actually implemented: two things were
+  # tried and empirically failed before this one. (1) A Jinja print
+  # expression embedded inside a quoted YAML string value (e.g.
+  # dev_row_limit: "<expr producing 90 or none>") always resolves to a
+  # Python *string* once rendered, no matter what the expression evaluates
+  # to — printed `none` stringifies to the text "None", so `var()` never
+  # actually returns None; an "is not none" check in the model then
+  # evaluated true even for prod, producing an invalid interval string.
+  # (2) A top-level Jinja if-block controlling which whole YAML line gets
+  # emitted (theorizing dbt renders the entire project file as Jinja before
+  # YAML-parsing it) failed too — verified directly: dbt-core 1.12.3 parses
+  # dbt_project.yml's structure before/without full-file Jinja rendering in
+  # this code path, so a bare `{% if %}` tag at the top level is invalid
+  # YAML and errors immediately, before any var is even evaluated. Given
+  # both, this var is a plain static value; target-awareness is applied in
+  # the *model* instead (models are unambiguously Jinja-rendered), gated on
+  # `target.name` directly — see models/staging/stg_service_requests.sql.
+  dev_row_limit: 90
+
+  # Timezone constant (C1.1b inferential evidence: call-volume-trough pattern,
+  # not a documented Socrata guarantee) — single documented place per
+  # phase-2.md's "problem 3", so every model touching a date boundary
+  # references this instead of scattering the assumption.
+  created_date_timezone: "America/New_York"
+
+  # Observation cutoff (C2.3/H2.2). Approved concept at 30 days; measuring the
+  # actual settlement curve directly (per H2.2's follow-up requirement, not
+  # inferred from C1.1's lag distribution) showed ~86% completeness at 30
+  # days across three clean 2026 cohorts — materially below the ~90% bar —
+  # so revised to 45 days (~93% completeness, consistent across cohorts).
+  # See docs/decisions.md and docs/findings.md for the full measurement.
+  observation_cutoff_days: 45

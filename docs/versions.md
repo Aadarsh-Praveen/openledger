@@ -55,3 +55,20 @@ Installed into `.venv` (Python 3.14.7) via:
 Full pinned list with per-line rationale comments lives in `requirements.txt`. Not
 installed yet, per phase-0 scope: **dbt-core, dbt-duckdb, soda-core-duckdb** (Phases 2
 and 3 — dry-run resolution only, verified above, nothing installed to `.venv`).
+
+## Phase 2 additions
+
+Installed 2026-08-21 via `pip install dbt-core dbt-duckdb` (matches the Phase 0
+dry-run probe — resolved cleanly the same way, now actually installed):
+
+| Package | Installed version | Why it matters |
+|---|---|---|
+| dbt-core | 1.12.3 | Modeling framework: staging/intermediate/marts, tests, docs. |
+| dbt-duckdb | 1.11.0 | dbt adapter targeting local DuckDB; supports the `iceberg` extension and arbitrary connection `settings`/`extensions` via the profile, which is what makes the direct bronze read path work (see C2.1 findings in `docs/decisions.md`). |
+| metricflow | 0.212.0 | Bundled transitively with dbt-core; this is the local, Apache-2.0 MetricFlow the Phase 4 semantic layer will use directly against dbt-core (not the paid dbt Cloud Semantic Layer — see CLAUDE.md's locked decision). |
+
+`duckdb` itself stayed at **1.5.5** (no downgrade forced by dbt-duckdb 1.11.0's
+`duckdb>=1.0.0` constraint) — the 1.4-LTS-vs-1.5+ distinction from Phase 0 still
+applies unchanged. ~40 further transitive dependencies (jinja2, jsonschema, sqlglot,
+etc.) pinned in `requirements.txt`, not individually annotated here — none are
+load-bearing for anything this project does directly.

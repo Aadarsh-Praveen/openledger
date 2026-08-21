@@ -1,0 +1,19 @@
+# Self-contained in the project (not ~/.dbt/profiles.yml) for reproducibility.
+# Run dbt from the repo root with: dbt <command> --project-dir dbt --profiles-dir dbt
+openledger:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: 'target/openledger_dev.duckdb'
+      extensions:
+        - iceberg
+      settings:
+        unsafe_enable_version_guessing: true
+    prod:
+      type: duckdb
+      path: 'target/openledger_prod.duckdb'
+      extensions:
+        - iceberg
+      settings:
+        unsafe_enable_version_guessing: true

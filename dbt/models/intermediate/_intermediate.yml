@@ -1,0 +1,45 @@
+version: 2
+
+models:
+  - name: int_request_resolution
+    description: >
+      Grain: one row per unique_key, matching stg_service_requests. Implements
+      the three-flag censoring design: is_closed (status = 'Closed' and
+      closed_date is not null), is_settled (created_date old enough per
+      observation_cutoff_days, keyed on created_date — see docs/findings.md
+      for why this must not key on closed_date), and is_censored (not is_closed
+      or not is_settled). resolution_hours is populated only when neither
+      condition censors the row; null in every other case, by construction.
+    columns:
+      - name: unique_key
+        description: Same grain as stg_service_requests.
+        data_tests:
+          - unique
+          - not_null
+      - name: is_closed
+        data_tests:
+          - not_null
+      - name: is_settled
+        data_tests:
+          - not_null
+      - name: is_censored
+        data_tests:
+          - not_null
+      - name: resolution_hours
+        description: >
+          Hours between created_date and closed_date. Null whenever is_censored
+          is true — verified directly, not assumed (see the resolution_hours
+          null-when-censored test on fct_service_requests, the load-bearing
+          proof of this contract).
+
+  - name: int_request_geography
+    description: >
+      Grain: one row per unique_key, matching stg_service_requests. Carries
+      the geography attributes needed to build dim_location and the fact
+      table's lat/long drill-down fields, without re-deriving anything
+      already resolved in staging.
+    columns:
+      - name: unique_key
+        data_tests:
+          - unique
+          - not_null

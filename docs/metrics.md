@@ -203,3 +203,86 @@ implemented — full detail in `docs/decisions.md`):**
   compaction/orphan-file utility exists anywhere in the package.
 - Phase 7 consequence: S3 mirror/Athena cost planning is sized on 731 MB —
   wrong if no retention policy runs before then.
+
+## Phase 2
+
+**C2.1 — dbt→DuckDB→Iceberg read path (measured live, throwaway test project):**
+- `dbt show` against a direct `iceberg_scan()` model returned **7,533,132**
+  rows — exact match to bronze's known count. Extension load +
+  `unsafe_enable_version_guessing` confirmed to persist across separate dbt
+  CLI invocations.
+- Full-table `count(*)`: 0.088s. Partition-pruned `count(*)` (1 month):
+  0.061s. Full-table all-columns materialization: **54.2s**.
+- Parquet-export fallback: 9.5s export + 41.6s read-back = 51.1s total (or
+  41.6s/run if export is amortized) — **~23% faster than direct reads, not
+  dramatically so.**
+- **Recommendation:** keep direct Iceberg reads; do not build the export
+  fallback. Full reasoning in `docs/decisions.md`.
+
+**Phase 7 benchmark baselines** (captured now per Gate 2 review, so the
+DuckDB-vs-Athena comparison in Phase 7 has a same-methodology local number to
+compare against, not a re-measurement done differently under time pressure):
+
+| Query | DuckDB time | Bytes scanned |
+|---|---|---|
+| Full-table `count(*)` | 0.088s | **0** — metadata-only, Iceberg manifest statistics satisfy the count without reading any Parquet data |
+| Partition-pruned `count(*)` (1 month, ~335k rows) | 0.061s | **0** — same metadata-only path |
+| Full-table materialization, all columns (7,533,132 rows) | 54.2s | full data volume (731 MB data files as of this measurement) |
+
+**This is the exact comparison Phase 7 is built on, stated explicitly so it
+isn't lost**: the two `count(*)` figures are local metadata reads that touch
+zero bytes of actual data — Athena has no equivalent free path for the
+identical query; it will scan and bill for the underlying data (or at best
+partition-level pruning, never a pure manifest-stats answer), so a naive
+"DuckDB did this in 0.09s, Athena took Xs" comparison is only fair once
+Athena's bytes-scanned and dollar cost are reported alongside its latency,
+not latency alone.
+
+**Environment, for a fair comparison:** Apple M3 Pro, 18 GB RAM, arm64/macOS
+15.7.3, DuckDB **1.5.5** (the 1.5+ line, not 1.4 LTS — see Phase 0's
+versions.md), dbt-duckdb 1.11.0, bronze at 7,533,132 rows / 731 MB (measured
+state as of Phase 1's completion, before Phase 2's own testing added
+snapshot-retention overhead — see the Phase 1 retention investigation for
+that separate number).
+
+**C2.10 — Final row counts, test results, build duration (prod target,
+full `dbt build`, models + tests together):**
+
+| Model | Layer | Rows |
+|---|---|---:|
+| `stg_service_requests` | staging | 7,533,132 |
+| `int_request_resolution` | intermediate | 7,533,132 |
+| `int_request_geography` | intermediate | 7,533,132 |
+| `dim_agency` | mart | 16 |
+| `dim_complaint_type` | mart | 1,278 |
+| `dim_location` | mart | 79 |
+| `dim_date` | mart | 1,230 |
+| `fct_service_requests` | mart | 7,533,132 |
+
+Staging reconciles exactly to bronze (7,533,132 = 7,533,132); the fact
+table's row count equals its distinct `unique_key` count with zero null
+foreign keys across all four dimension joins (the grain-violation bug from
+C2.6/C2.7 is fixed and re-verified here).
+
+**Test results** — 5 table models + 3 view models + 42 data tests:
+
+| Target | Models | Tests | Result | Full build duration |
+|---|---|---|---|---|
+| prod | 8 (5 table, 3 view) | 42 | 49 PASS / 1 WARN (by design) / 0 ERROR | ~10–12s |
+| dev (90-day slice) | 8 | 42 | 49 PASS / 1 WARN (by design) / 0 ERROR | ~7s |
+
+The one WARN is `assert_closed_date_after_created_date`, configured to warn
+at any failure count and error only above 2x the known defect rate — see
+`docs/decisions.md` C2.9. It fired at 1,763 rows (prod, ≈0.0242%) and 354
+rows (dev), consistent with the same underlying ~0.02% rate at each
+target's row count, never approaching the `error_if: '>3500'` ceiling.
+
+Test breakdown by category (42 total, via `dbt list --resource-type test`):
+8 `unique`, 27 `not_null`, 4 `relationships`, 3 hand-written singular SQL
+tests (`assert_resolution_hours_null_when_censored`,
+`assert_closed_date_after_created_date`,
+`assert_staging_reconciles_to_bronze`). Separately (not counted in the 42 —
+validated at build time, not as test nodes), **5 model contracts enforced**
+across the marts layer: `dim_agency`, `dim_complaint_type`, `dim_location`,
+`dim_date`, `fct_service_requests` — all columns explicitly typed, per
+phase-2.md's "marts only" scope for Phase 2.

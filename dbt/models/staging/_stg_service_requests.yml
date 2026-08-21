@@ -1,0 +1,49 @@
+version: 2
+
+models:
+  - name: stg_service_requests
+    description: >
+      Grain: one row per unique_key, matching bronze's own grain (uniqueness
+      guaranteed by bronze's upsert, per Phase 1 — not re-derived here). Renames
+      and lightly cleans the bronze source: canonical latitude/longitude (see
+      docs/decisions.md for the disagreement-rate check against location_lat/lon),
+      a has_valid_coordinates boolean (never a row filter), case-normalized text
+      fields, and all date/timestamp columns except updated_at localized to
+      America/New_York via the created_date_timezone var. In the dev target only,
+      filtered to a recent slice via the dev_row_limit var.
+    columns:
+      - name: unique_key
+        description: Bronze's natural key; one row per unique_key at this grain.
+        data_tests:
+          - unique
+          - not_null
+      - name: created_date
+        description: >
+          Localized to America/New_York (see created_date_timezone var);
+          the single documented timezone assumption for this project.
+        data_tests:
+          - not_null
+      - name: closed_date
+        description: Null while a request is open or unresolved.
+      - name: agency
+        description: Agency code (e.g. NYPD, HPD). Joins to dim_agency.
+      - name: complaint_type
+        description: Upper-cased and trimmed. Joins to dim_complaint_type with descriptor.
+      - name: descriptor
+        description: Upper-cased and trimmed; null descriptor is left null, not coalesced.
+      - name: status
+        description: Trimmed source status string (e.g. "Closed", "Open", "Assigned").
+      - name: borough
+        description: Upper-cased and trimmed. Joins to dim_location alongside community_board.
+      - name: community_board
+        description: >
+          Format "NN BOROUGH" (e.g. "12 BRONX"). Chosen as dim_location's key —
+          see docs/decisions.md — because it already encodes borough + community
+          district as one stable field.
+      - name: has_valid_coordinates
+        description: >
+          True when latitude/longitude are both present and within NYC's bounding
+          box and not exactly (0, 0). A boolean flag, never a row filter — missing
+          coordinates reach ~1.7% of rows, out-of-bounds is ~0%.
+        data_tests:
+          - not_null

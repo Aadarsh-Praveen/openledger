@@ -1,0 +1,31 @@
+version: 2
+
+sources:
+  - name: bronze
+    description: >
+      The Iceberg bronze layer written by ingest/pipeline.py (Phase 1) — one
+      row per unique_key, watermarked incremental MERGE on :updated_at.
+    schema: main
+    tables:
+      - name: service_requests
+        description: >
+          NYC 311 service requests, 24-month backfill window (2024-08-19 to
+          present) plus ongoing incremental updates. Grain: one row per
+          unique_key (bronze's upsert key).
+        meta:
+          # Resolved by dbt-duckdb's SourceConfig template substitution
+          # (relation.py: "if '(' not in ext_location ... treat as a raw
+          # expression"), rendered via project Jinja before that — see
+          # macros/bronze_scan.sql for the one place this expression lives.
+          external_location: "iceberg_scan('{{ var(\"bronze_warehouse_root\") }}', allow_moved_paths => true)"
+        loaded_at_field: updated_at
+        freshness:
+          # Provisional thresholds for `dbt source freshness` (Phase 6 wires
+          # this into CI — see docs/decisions.md's C1.1/C1.1b lag findings:
+          # 2.53-day floor, 6.71-day median, up to 92-day tail). warn_after is
+          # tighter than the median so a real slowdown surfaces before it
+          # becomes routine; error_after is looser than the median to avoid
+          # paging on ordinary variance, but well inside the 92-day tail.
+          # Revisit with real Phase 6 operational data before trusting these.
+          warn_after: {count: 3, period: day}
+          error_after: {count: 10, period: day}

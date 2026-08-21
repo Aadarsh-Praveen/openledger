@@ -1,0 +1,189 @@
+version: 2
+
+models:
+  - name: dim_agency
+    description: >
+      Grain: one row per distinct (agency, agency_name) pair. 16 members in
+      the full prod build.
+    config:
+      contract:
+        enforced: true
+    columns:
+      - name: agency_key
+        data_type: bigint
+        data_tests:
+          - unique
+          - not_null
+      - name: agency
+        data_type: varchar
+        data_tests:
+          - not_null
+      - name: agency_name
+        data_type: varchar
+
+  - name: dim_complaint_type
+    description: >
+      Grain: one row per distinct (complaint_type, descriptor) pair. 1,278
+      distinct pairs across 202 distinct complaint_type values in the full
+      prod build (~6.3 descriptors/type on average).
+    config:
+      contract:
+        enforced: true
+    columns:
+      - name: complaint_type_key
+        data_type: bigint
+        data_tests:
+          - unique
+          - not_null
+      - name: complaint_type
+        data_type: varchar
+        data_tests:
+          - not_null
+      - name: descriptor
+        data_type: varchar
+
+  - name: dim_location
+    description: >
+      Grain: one row per distinct (community_board, borough) pair — the full
+      pair, not community_board alone, because 646 source rows pair the same
+      community_board string with two different borough values (a real data
+      quality finding — see docs/decisions.md). 79 rows in the full prod build.
+    config:
+      contract:
+        enforced: true
+    columns:
+      - name: location_key
+        data_type: bigint
+        data_tests:
+          - unique
+          - not_null
+      - name: community_board
+        data_type: varchar
+        data_tests:
+          - not_null
+      - name: borough
+        data_type: varchar
+
+  - name: dim_date
+    description: >
+      Grain: one row per calendar day, 2024-08-19 through 2027-12-31 (1,230 rows).
+    config:
+      contract:
+        enforced: true
+    columns:
+      - name: date_key
+        data_type: date
+        data_tests:
+          - unique
+          - not_null
+      - name: calendar_date
+        data_type: date
+        data_tests:
+          - not_null
+      - name: year
+        data_type: bigint
+      - name: quarter
+        data_type: bigint
+      - name: month
+        data_type: bigint
+      - name: month_name
+        data_type: varchar
+      - name: day_of_month
+        data_type: bigint
+      - name: day_of_week
+        data_type: bigint
+      - name: day_name
+        data_type: varchar
+      - name: is_weekend
+        data_type: boolean
+      - name: season
+        data_type: varchar
+
+  - name: fct_service_requests
+    description: >
+      Grain: ONE ROW PER unique_key — the single most important piece of
+      documentation in this project. 982,790 rows in the dev slice / 7,533,132
+      in the full prod build, verified equal to the distinct unique_key count
+      with zero null foreign keys across all four dimensions. No
+      pre-aggregation; the Phase 4 semantic layer aggregates over this grain.
+    config:
+      contract:
+        enforced: true
+    columns:
+      - name: unique_key
+        data_type: varchar
+        description: Fact grain. Uniqueness here is the load-bearing proof the grain holds.
+        data_tests:
+          - unique
+          - not_null
+      - name: agency_key
+        data_type: bigint
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_agency')
+                field: agency_key
+      - name: complaint_type_key
+        data_type: bigint
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_complaint_type')
+                field: complaint_type_key
+      - name: location_key
+        data_type: bigint
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_location')
+                field: location_key
+      - name: date_key
+        data_type: date
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_date')
+                field: date_key
+      - name: created_date
+        data_type: timestamptz
+        data_tests:
+          - not_null
+      - name: closed_date
+        data_type: timestamptz
+      - name: updated_at
+        data_type: timestamptz
+        data_tests:
+          - not_null
+      - name: resolution_hours
+        data_type: bigint
+        description: Null whenever is_censored is true — see the dedicated data test below.
+      - name: is_closed
+        data_type: boolean
+        data_tests:
+          - not_null
+      - name: is_censored
+        data_type: boolean
+        data_tests:
+          - not_null
+      - name: is_settled
+        data_type: boolean
+        data_tests:
+          - not_null
+      - name: has_valid_coordinates
+        data_type: boolean
+        data_tests:
+          - not_null
+      - name: latitude
+        data_type: double
+      - name: longitude
+        data_type: double
+      - name: incident_zip
+        data_type: varchar
+      - name: status
+        data_type: varchar
+      - name: borough
+        data_type: varchar
