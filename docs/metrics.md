@@ -351,7 +351,7 @@ in `docs/decisions.md`):
 
 | Detector | Backtested firings | Correction from original journal entry |
 |---|---|---|
-| (a) Undated-closure rate (redesigned) | DHS: 25/25 monthly cumulative scans. DSNY: 10/25 (2025-04–2026-01, resolved, currently 0.0066% vs. 0.008705% threshold) | Journal originally claimed 0 non-DHS firings — never actually checked for the cumulative backtest; corrected |
+| (a) Undated-closure rate (redesigned) | DHS: 25/25 monthly cumulative scans. All 15 other agencies: 0/25 (final, point-in-time threshold) | Two corrections: journal originally claimed 0 non-DHS firings (never checked); then found DSNY firing 10/25 under a static threshold; then found that 10/25 was itself a look-ahead bug in the threshold, fixed 2026-08-24 — see `docs/decisions.md` |
 | (b) Composition-drift (YoY) | 2 of **194** evaluations (STREET CONDITION Mar 2026 +5.88pp; NOISE-RESIDENTIAL Jan 2026 −12.10pp) | Journal's back-of-envelope 195 assumed every top-15 type has nonzero volume every eligible month; one cell (WATER SYSTEM, partial Aug 2026) is empty |
 | (c) Vocabulary-drift | 2 new agencies (`OOS`, `NYC311-PRD`), 17/23 months with ≥1 new complaint type | None — matches exactly |
 | (d) Settlement-completeness | 0 fails/warns across 4 eligible cohorts (Feb 92.06%, Mar 92.98%, Apr 93.92%, **May 2026 95.25% — newly eligible since the journal was last written**, one day of wall-clock time having aged it past the 90-day mark) | None — matches, plus one new cohort as expected |

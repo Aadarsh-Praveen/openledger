@@ -2374,6 +2374,42 @@ and DSNY's transient historical firings should NOT be read as 10 separate
 incidents requiring investigation; they are one continuous, now-resolved,
 sub-threshold-margin condition.
 
+**Second correction (2026-08-24, found answering a user question about
+the above — the DSNY finding was itself wrong, not just DHS's "0 non-DHS
+firings" claim).** The question that exposed it: if DSNY's cumulative
+rate *ends* at 0.0066% (comfortably under the 0.008705% threshold), why
+would it have been *above* threshold at any earlier point, given the
+threshold above was computed once from the full-history distribution as
+it stands *today*? Tested directly: recomputed the threshold
+**independently at each of the 25 scan_months, using only data available
+as of that same month** (no look-ahead into later months), instead of one
+threshold computed from today's endpoint and applied to all 25 historical
+checkpoints. Result: **DSNY fires in 0 of 25 scans under a point-in-time
+threshold — every one of its 10 "firings" above was an artifact of
+comparing a 2025 rate against a 2026-computed threshold**, not a real
+excursion. DHS is unaffected (still 25/25; its margin is large enough at
+every single historical checkpoint, not just today, for the look-ahead
+distinction to matter). Every other agency also fires 0/25 under either
+threshold. **`dq_detector_undated_closure_rate.sql` fixed** to compute
+the threshold per scan_month rather than once; re-verified against this
+corrected methodology, not just asserted.
+
+**What this means for the two "genuine limitation" framings above**:
+neither the "5·stdev may be too tight" concern nor the "DSNY has a thin
+transient margin" finding holds up — both were built on a threshold that
+was never a fair comparison for the months being evaluated. DSNY's own
+rate trajectory (rising to a real peak of 0.0118% at 2025-06, then
+declining to 0.0066% today) is real and unchanged; what was wrong is
+comparing it to a threshold that hadn't been computed yet at the time.
+5·stdev, evaluated fairly (point-in-time), clears every non-DHS agency at
+every historical checkpoint with comfortable margin (DSNY's closest
+approach was still meaningfully under its own contemporaneous threshold —
+e.g. 0.0118% vs. 0.01657% in June 2025) — no evidence it needs widening.
+This is the "framing mismatch" branch, not the "genuine finding" branch:
+the detector's *design* (mean + 5·stdev, agency-level, date-free) was
+correct all along; only its *implementation* (a static threshold applied
+retroactively) was buggy.
+
 **Report requirement satisfied**: the distribution table above makes DHS
 visible as a rate sitting ~2,000x above the derived threshold and
 ~38,600x above the mean of the other 15 agencies (17.29% vs. 0.000448%)
@@ -2581,7 +2617,7 @@ monitoring consequence, in `docs/findings.md`.**
 
 | Detector | Threshold(s) | Backtested firings / 24 months (as reproduced in code, 2026-08-23) | Notes |
 |---|---|---|---|
-| (a) REDESIGNED — agency-level rate | rate > mean + 5·stdev of non-DHS agencies (0.008705%), date-free | DHS: 25/25 monthly cumulative scans (persistent). DSNY: 10/25 (2025-04–2026-01, now resolved — corrected from the "0 non-DHS firings" originally reported, an error, not a code discrepancy) | Original date-grouped design rejected at H3.2 — see correction above |
+| (a) REDESIGNED — agency-level rate | rate > mean + 5·stdev of non-DHS agencies, computed POINT-IN-TIME per scan (not a single static value — see the second correction above) | DHS: 25/25 monthly cumulative scans (persistent). All 15 other agencies: 0/25 (DSNY's apparent 10/25 was a look-ahead artifact in the threshold computation, fixed — not a real excursion) | Original date-grouped design rejected at H3.2; threshold's look-ahead bug found and fixed 2026-08-24 |
 | (b) Composition-drift | \|YoY share delta\| > 5pp, top 15 types | 2 of 194 evaluations (corrected from 195 — one type-month cell is empty due to the partial Aug 2026 month) — STREET CONDITION Mar 2026; NOISE-RESIDENTIAL Jan 2026 | Correctly suppresses HEAT/HOT WATER's much larger but twice-recurring seasonal swing |
 | (c) Vocabulary-drift | none (notification only) | 2 new agencies, 17/23 months with ≥1 new complaint type | `NYC311-PRD` flagged as suspicious, not a confirmed defect |
 | (d) Settlement-completeness | warn <90%, fail <85% at day 45, ≥90-day-old cohorts only | 0 (Feb/Mar/Apr 2026 at 92-94%, matching Phase 2; May 2026 newly eligible as of this run at 95.25%) | Reproduced Phase 2's exact numbers as a validation, not new drift |
@@ -2792,19 +2828,21 @@ what changed across C3.6-C3.8, beyond what's already detailed above:
 | 3 (load-bearing) | Unit tests cover boundary cases | ✅ | 7 unit tests; 45-day boundary tested at exactly 44/45/46 days; a real timezone bug found and fixed while writing them |
 | 4 | Distributional checks running | ✅ | 6 checks, in both Soda and an independent SQL cross-check in the scorecard; both agree on today's 5/6 (bronze staleness, not a defect) |
 | 5 | Bulk-closure detector catches DHS | ✅ | Redesigned detector (a): DHS fires 25/25 monthly cumulative scans, ~2,000x the threshold |
-| 6 (load-bearing) | Other sweeps found or ruled out | ✅ | Detector (e): 6 mass-touch nights found across 24 months, full detail in `docs/findings.md`. Detector (a): DSNY's transient 10-month marginal firing found, characterized, and shown resolved — not swept under the rug |
+| 6 (load-bearing) | Other sweeps found or ruled out | ✅ | Detector (e): 6 mass-touch nights found across 24 months, full detail in `docs/findings.md`. Detector (a): all 15 non-DHS agencies ruled out, 0/25 firings, once a look-ahead bug in the threshold (found 2026-08-24, see the second correction above) was fixed |
 | 7 | Composition detector catches STREET CONDITION | ✅ | Confirmed; does not fire on HEAT/HOT WATER's larger recurring swing; honestly caveated as only one pothole season observed so far |
 | 8 | Vocabulary monitor works | ✅ | 2 new agencies with first-seen dates/volumes; 17/23 months with new complaint types |
 | 9 | Settlement tracker running | ✅ | 4 eligible cohorts, 92.06%-95.25%, all passing |
-| 10 (load-bearing) | False-positive rates reported | ✅ | Every detector's firing count stated; DSNY's marginal case in detector (a) explicitly reported as a real, documented limitation, not hidden |
+| 10 (load-bearing) | False-positive rates reported | ✅ | Every detector's firing count stated per agency/month/night; DSNY's apparent firing was investigated on request, found to be a threshold look-ahead bug (not a real excursion), fixed, and re-verified rather than either hidden or left mischaracterized as a "real limitation" |
 | 11 | Thresholds approved | ✅ | H3.2 (2026-08-22) and H3.2b (2026-08-22) both recorded |
 | 12 | Scorecard mart built | ✅ | 103 rows, 4 categories, incremental (accumulates one row-set per run_date) |
 | 13 | DHS SLA delta quantified | ✅ | 17,356 rows, 2024-08-19 to 2025-05-06; 80.97% → 98.61%, +17.65pp |
 | 14 | Suite runnable in one command | ✅ | `dbt build` (13.9s) + `quality/run_soda.py` (2.0s), ~16s total, documented as two necessarily-separate steps with the reason why |
-| 15 | One atomic commit | pending | This commit |
+| 15 | One atomic commit | ✅ | `c89f11a`, "Phase 3: data quality contracts, unit tests, and operational scorecard"; this clarification (the detector (a) threshold fix) lands in a small follow-up commit rather than reopening/amending it |
 
 **Load-bearing criteria 3, 6, 10 all hold with real depth, not just a
-checkmark**: 3 caught a genuine timezone bug during the work itself; 6
-found a second real anomaly detector (DSNY) beyond the one it was
-calibrated on; 10 reported that anomaly honestly rather than quietly
-tuning the threshold to make it disappear.
+checkmark**: 3 caught a genuine timezone bug during the work itself; 6 and
+10 together caught and fixed a genuine look-ahead bug in detector (a)'s
+threshold — found not during the original build, but by taking a user's
+follow-up question seriously enough to actually re-derive the answer
+(point-in-time vs. static threshold) instead of restating the prior,
+now-superseded explanation with more confidence.
