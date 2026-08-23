@@ -1,0 +1,10 @@
+data_source openledger_prod:
+  type: duckdb
+  # Absolute path, matching this project's existing convention (see
+  # dbt/dbt_project.yml's bronze_warehouse_root) — Soda, like dbt-duckdb,
+  # resolves relative paths against the invoking process's cwd, not this
+  # file's location, so relative paths here would be fragile depending on
+  # where `soda scan` is launched from.
+  path: /Users/aadarsh_praveen/Documents/Projects/Personal_Projects/OpenLedger/openledger/dbt/target/openledger_prod.duckdb
+  read_only: true
+  schema: main

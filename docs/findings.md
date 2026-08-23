@@ -271,3 +271,186 @@ up the dataset-wide missing-coordinate percentage, and the rate falls back
 as STREET CONDITION's share of volume normalizes through the summer. The
 underlying per-complaint-type geocoding behavior looks stable; what
 changes month to month is the mix.
+
+## C3.5 — Findings from calibrating the operational detectors
+
+Full methodology and thresholds in `docs/decisions.md`'s C3.5 entry. Real
+findings surfaced while backtesting the four detectors against the full
+24-month history.
+
+### Correction to the C2.8 bulk-closure finding — a methodological lesson
+
+The original finding ("11,372 rows, one `:updated_at`, two DHS templates —
+a bulk administrative closure sweep") needs a correction. Grouping by the
+*exact* `:updated_at` timestamp — not just the date, which is what the
+original investigation checked — shows DHS's rows are spread across dozens
+of distinct sub-second timestamps that day, and that **every** agency
+(NYPD, HPD, DOT, DSNY, DEP, DPR, DOHMH, DOB) shows the same tight,
+synchronized `:updated_at` activity between roughly 13:25 and 13:52 on
+2025-12-26. This is not a DHS-specific action — it has the signature of
+the December 2025 Socrata migration already documented in Phase 1, a
+platform-wide metadata touch, not a targeted sweep.
+
+What remains true and DHS-specific: the underlying "`Closed` status, null
+`closed_date`, resolved via one of two templated outreach phrases" pattern
+is 99.9% DHS (11,366 of 11,372 qualifying rows across the full dataset —
+only DSNY shows any of this pattern at all, at 6 rows). This is a real,
+DHS-specific data anomaly. It just wasn't *created* by a one-off DHS
+decision on 2025-12-26 — that date is when the platform-wide migration
+happened to touch these already-anomalous rows' `:updated_at`, the same as
+it touched everything else's.
+
+**The lesson, stated plainly**: grouping by *date* instead of *exact
+timestamp* turned accumulated state into an apparent event. DHS's
+closed-without-a-date backlog had been sitting in the data for months
+before 2025-12-26; the migration didn't create it, it merely stamped the
+whole backlog with one shared `:updated_at` date, which made a long-lived,
+date-free condition look like a discrete, dated incident when queried the
+wrong way. **This directly invalidated detector (a) as originally
+designed** (`group by (agency, date(updated_at))`, fire on cluster size +
+template concentration): a date-grouped query only finds this kind of
+backlog on the day something else happens to touch it, so it would find
+nothing in an ordinary period (the anomaly has no date signature of its
+own) and would false-positive on *any* agency's accumulated backlog the
+next time a platform-wide migration touches `:updated_at` — reporting the
+migration's date, not the agency's actual condition. Redesigned as an
+agency-level, date-free rate detector instead — see `docs/decisions.md`,
+C3.5(a) redesign, for the full metric and backtest.
+
+### Mass `:updated_at` touches are a recurring, near-nightly platform behavior — not isolated incidents
+
+Originally flagged as "a second, previously undocumented mass touch"
+(2026-08-20, HPD). A systematic backtest run while designing detector (e)
+(see `docs/decisions.md`, C3.5(e)) shows the true shape of this is bigger
+and more structural than "a couple of one-off incidents": **13+ of the
+dataset's agencies show simultaneous `:updated_at` activity in the same
+hour, on 180 of the ~730 nights in the 24-month history** — a recurring,
+near-daily platform behavior (matching the ~01:33 UTC daily signature
+already noted in Phase 1's C1.7d republish-noise finding), not three
+isolated events. Ordinary nights in this pattern move a "background" 4,825
+to ~20,000 rows across agencies (median 11,506) — this is normal Socrata
+platform noise, not a defect.
+
+**What is a genuine anomaly is the volume tail.** Deriving a threshold from
+the measured variance of that background distribution (mean 11,667 rows,
+population stdev 4,392, excluding the two most extreme nights; threshold =
+mean + 3·stdev ≈ 24,842 rows) and backtesting across all 24 months finds
+**6 nights that exceed it**, not 2 or 3:
+
+| Date | Agencies touched | Rows | Dominant agency |
+|---|---|---|---|
+| 2025-12-26 | 15 | **4,347,980** | platform-wide (the Dec 2025 Socrata migration, already documented in Phase 1) |
+| 2025-12-31 | 15 | 50,337 | NYPD (26,676) |
+| 2026-02-16 | 13 | 121,863 | HPD (114,590 — 94% of the night's volume) |
+| 2026-04-28 | 13 | 31,899 | DOHMH (21,269) |
+| 2026-07-15 | 13 | 26,717 | NYPD (8,999, more evenly spread) |
+| 2026-08-20 | 14 | 522,196 | HPD (441,839 — 85% of the night's volume) |
+
+The Dec 2025 migration is the only genuinely platform-wide event (all 15
+agencies, no single-agency concentration). The other five, including the
+original 2026-08-20 finding, are each dominated by one agency having an
+unusually large batch that particular night (HPD twice, NYPD twice,
+DOHMH once) riding on top of the same nightly cross-agency touch pattern
+— not necessarily a repeat of the same phenomenon as the December
+migration, just a bigger night for one agency's own batch process. Neither
+the 2026-02-16 nor the 2026-08-20 HPD nights show template concentration
+(HPD's closure vocabulary is fully represented in both, no single template
+over ~16%), consistent with ordinary (if unusually large) batch closure
+activity, not a synthetic or erroneous write.
+
+**Phase 6 consequence, stated explicitly**: any freshness or lag
+monitoring built on `:updated_at` (Phase 6's planned use of this field)
+will see a noisy, heavy-tailed signal by construction — a "typical" night
+moves ~11,500 rows across most agencies regardless of real activity, and
+roughly 1 night in 4 months moves an order of magnitude more. A naive
+freshness check keyed on raw `:updated_at` row-touch volume will be
+dominated by this platform noise rather than genuine data staleness.
+Detector (e) (`docs/decisions.md`, C3.5(e)) exists specifically to
+characterize and flag this tail so Phase 6's freshness monitoring can be
+built to ignore or separately account for it, rather than being corrupted
+by it silently.
+
+### New finding: NOISE - RESIDENTIAL, January 2026 (−12.1pp YoY, found but not fully root-caused)
+
+The composition-drift detector's backtest fired on this in addition to its
+STREET CONDITION calibration case. Traced entirely to one descriptor,
+`LOUD MUSIC/PARTY`: 56,133 rows in January 2025 vs. 12,204 in January
+2026, against a stable ~12,000-20,000/month baseline in every neighboring
+month (Dec 2024: 32,455; Feb 2025: 13,756). **January 2025 is the true
+outlier, not January 2026** — January 2026 fits its own surrounding months
+smoothly. Checked whether this was a narrow New Year's-specific spike
+(Dec 28 - Jan 4 daily counts): elevated across the whole week
+(2,400-4,600/day), not concentrated on Jan 1-2, so a clean "New Year's
+noise" story doesn't fully explain it either. Left open rather than
+guessed at — a real, documented anomaly in the first January of this
+dataset's history, cause not yet established.
+
+### New agency: `NYC311-PRD` (first seen 2026-03, 371 rows)
+
+The vocabulary-drift monitor's backtest found one new agency value since
+the original 14-16-agency baseline: `NYC311-PRD`, first appearing March
+2026. Unlike `OOS` (also newly seen, September 2025, but already a known
+legitimate small agency), `NYC311-PRD` reads as a 311-system routing or
+placeholder code rather than a genuine city agency — flagged as an open
+question, not confirmed as a defect. Worth a closer look before Phase 4
+treats it as a normal `dim_agency` member on the same footing as NYPD or
+HPD.
+
+### DHS's undated-closure backlog is bounded and non-growing — a materially different statement than "DHS has this problem" (README-bound)
+
+Found while redesigning detector (a) at H3.2 (full methodology in
+`docs/decisions.md`, C3.5(a) REDESIGNED). Breaking the 17,356 DHS
+closed-with-null-date rows down by **created_date cohort month**, not just
+counting them in aggregate, shows they were created in a bounded window —
+**2024-08-19 through 2025-05-06** — and that **zero new rows of this
+pattern have been created in any month since May 2025** (15 consecutive
+clean cohort-months, through the most recent complete month). A simulated
+monthly production scan confirms the *count* of these rows has been
+completely flat (17,356 in every scan from June 2025 onward) even as
+DHS's total closed-row count keeps growing normally around it.
+
+**Why this matters for how the finding gets described**: "DHS has an
+ongoing data-quality problem with undated closures" and "DHS accumulated a
+17,356-row backlog during a 9-month window that ended 15 months ago, and
+has not produced a single additional occurrence since" are different
+claims with different implications for a reader. The first suggests an
+active, unaddressed defect in DHS's current operations; the second
+describes a bounded historical artifact — something that happened, is
+fully characterized, and is not presently recurring. **This is the correct
+framing for the README** (and for anyone assessing whether DHS's current
+process needs attention): the backlog is real, large, and still
+unremediated in the data as it stands today (see C3.7 for its quantified
+effect on DHS's apparent closure rate), but it is not evidence of an
+ongoing operational issue at DHS.
+
+**One caveat, stated plainly**: "no growth since May 2025" is a fact about
+what the *data* currently shows, not a guarantee about DHS's underlying
+process going forward — it describes what happened, not a promise about
+what will keep happening. Detector (a) (`dq_detector_undated_closure_rate.sql`)
+continues to evaluate this every run specifically so that if new
+undated-closure rows for any agency ever do appear, that fact surfaces on
+its own rather than requiring someone to remember to re-check by hand.
+
+## C3.7 — The DHS undated-closure exclusion, quantified
+
+Full mechanism and recommendation in `docs/decisions.md`, C3.7. The
+number, stated once here plainly: **excluding DHS's 17,356-row
+undated-closure backlog (created 2024-08-19 through 2025-05-06) from a
+closure-rate/SLA calculation changes DHS's apparent closure rate by +17.65
+percentage points — from 80.97% (backlog counted as "settled, not closed")
+to 98.61% (backlog excluded entirely).**
+
+This is a materially different statement about DHS's actual performance
+than the raw number implies, and it runs the opposite direction from what
+was originally suspected in Phase 2/C2.8 (that a bulk-closure sweep might
+artificially *inflate* an SLA metric). Here, leaving the backlog in
+without accounting for it makes DHS look meaningfully *worse* than its
+real, current process — 78,531 requests are genuinely, successfully
+resolved either way; the only question is whether 17,356 rows with no
+usable resolution date get counted against DHS's denominator (making the
+rate look like 81%) or set aside as an administrative category outside an
+SLA metric's scope (98.6%, matching what DHS's process actually delivers
+on requests it can compute a duration for). Any DHS-specific SLA figure
+that doesn't state which of these two readings it's using — including any
+number that eventually reaches the README or the Phase 5 dashboard — is
+not fully specified.

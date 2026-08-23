@@ -65,6 +65,7 @@ select
     resolution.is_closed,
     resolution.is_censored,
     resolution.is_settled,
+    resolution.is_undated_closure,
     geography.has_valid_coordinates,
 
     -- Kept at fact grain for anything a dimension join can't answer directly

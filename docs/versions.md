@@ -72,3 +72,26 @@ dry-run probe — resolved cleanly the same way, now actually installed):
 applies unchanged. ~40 further transitive dependencies (jinja2, jsonschema, sqlglot,
 etc.) pinned in `requirements.txt`, not individually annotated here — none are
 load-bearing for anything this project does directly.
+
+## Phase 3 additions
+
+**Two separate, deliberately un-mergeable environments** (per C3.1's Soda/DuckDB
+resolution — H3.1 approved): the main project venv (`.venv/`, `requirements.txt`)
+and a second, independent venv for Soda (`.venv-soda/`, `requirements-soda.txt`),
+installed 2026-08-21.
+
+| Environment | Python | DuckDB | soda-core-duckdb | Why separate |
+|---|---|---|---|---|
+| `.venv/` (main) | 3.14.7 | **1.5.5** | not installed | Everything else in the project — dbt, pyiceberg, ingestion. |
+| `.venv-soda/` (Soda only) | 3.11.15 | **1.0.0** | 3.5.6 | `soda-core-duckdb` 3.5.6 (the latest release as of this check) still hard-pins `duckdb<1.1.0` in its published wheel metadata — confirmed directly, not assumed. Cannot coexist with the main venv's DuckDB 1.5.5 in one environment. |
+
+**The compatibility this rests on is verified for today's exact versions only, not
+guaranteed going forward** (H3.1's first requirement): DuckDB 1.0.0 was confirmed
+able to read a database file written by DuckDB 1.5.5 (C3.1's storage-format check),
+but a future upgrade to either pin could break that silently — DuckDB's storage
+format has changed across major versions before. `quality/run_soda.py` asserts
+this compatibility explicitly at scan start every run (H3.1's second requirement —
+see `docs/decisions.md`, C3.4) rather than relying on this table staying accurate.
+
+Full pinned list for the Soda environment, with the same "why separate" rationale,
+lives in `requirements-soda.txt`.

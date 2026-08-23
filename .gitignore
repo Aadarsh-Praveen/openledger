@@ -11,6 +11,7 @@ state/*
 __pycache__/
 *.pyc
 .venv/
+.venv-soda/
 target/
 logs/
 dbt_packages/

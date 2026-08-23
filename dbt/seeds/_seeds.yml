@@ -1,0 +1,23 @@
+version: 2
+
+seeds:
+  - name: quality_acknowledgments
+    description: >
+      C3.6 review note 1: a permanently-firing detector (DHS's undated-
+      closure rate, which fires every scan by design — see
+      docs/decisions.md, C3.5(a) REDESIGNED) must be presented differently
+      from an event detector in the scorecard, or it becomes wallpaper.
+      Rows here map a (check_name, grain) to a dated acknowledgment; the
+      scorecard overrides a would-be 'fail' to 'acknowledged' only for a
+      matching row, carrying the acknowledged_date through so the
+      acknowledgment itself is visible, not just the suppression.
+    columns:
+      - name: check_name
+        data_tests:
+          - not_null
+      - name: grain
+        data_tests:
+          - not_null
+      - name: acknowledged_date
+        data_tests:
+          - not_null

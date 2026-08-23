@@ -286,3 +286,100 @@ validated at build time, not as test nodes), **5 model contracts enforced**
 across the marts layer: `dim_agency`, `dim_complaint_type`, `dim_location`,
 `dim_date`, `fct_service_requests` — all columns explicitly typed, per
 phase-2.md's "marts only" scope for Phase 2.
+
+## Phase 3 (C3.1–C3.4; C3.5 backtests recorded in `docs/decisions.md`/`docs/findings.md`,
+not yet reduced to a single re-runnable metric — see that section for the raw
+counts pending H3.2 approval and code implementation)
+
+**C3.1 — Soda/DuckDB dependency resolution.** Option 1 (separate venv), chosen
+after empirical testing per phase-3.md's stated preference order — `soda-core-duckdb`
+3.5.6 (the latest release at the time of checking) still hard-pins `duckdb<1.1.0` in
+its published wheel metadata, confirmed directly rather than assumed. Two
+independent, non-merged environments: `.venv/` (main project, DuckDB **1.5.5**) and
+`.venv-soda/` (Soda only, DuckDB **1.0.0**). Cross-version read compatibility (1.0.0
+reading a `.duckdb` file written by 1.5.5) verified empirically, not assumed — see
+H3.1 confirmation below for the live re-test of this exact claim.
+
+**C3.2 — Model contracts, all layers.** **8 models, 101 columns at the time C3.2 was
+built** (49 staging + 14 intermediate + 38 marts), all with `contract: enforced:
+true` and an explicit `data_type` on every column (verified by counting
+`data_type:` entries in each layer's schema file): the 5 marts-layer contracts were
+already in place as of Phase 2; C3.2's addition was the 1 staging + 2 intermediate
+models, +63 columns. **Updated to 103 columns by C3.7** (`is_undated_closure` added
+to `int_request_resolution` and `fct_service_requests`, +1 column each) — current,
+live count verified every build by `assert_dq_scorecard_contract_counts_match_schema.sql`,
+not left to drift silently; see `docs/decisions.md`, C3.6, for a self-caught error
+in this exact number and why that test exists. A deliberate contract break
+(mismatched `data_type`) was tested and shown to fail the build, then reverted — see
+`docs/decisions.md`, C3.2, for the captured failure output.
+
+**C3.3 — dbt unit tests.** **7 unit tests**, all against `int_request_resolution`,
+all passing: normal resolution-hours computation, the closed-before-created defect
+passed through unsuppressed, an open request's censoring, a closed-but-unsettled
+request's forced-null resolution, and the 45-day `is_settled` boundary tested at
+exactly 44/45/46 days (inclusive on 45, per the model's `<=`). A real bug —
+`is_settled` resolving against DuckDB's session `TimeZone` setting instead of the
+project's documented `created_date_timezone` — was found and fixed in
+`int_request_resolution.sql` while writing these tests (see `docs/decisions.md`,
+C3.3). A separate DST-boundary case (ambiguous fall-back hour, nonexistent
+spring-forward hour) could not be expressed as a native dbt unit test — the source
+relation is an inline `iceberg_scan()` expression with nothing to introspect — so it
+is implemented instead as the singular data test
+`assert_timezone_localization_dst_boundaries.sql`, run in every `dbt build`.
+
+**C3.4 — Distributional checks.** **6 checks** in `quality/soda/checks/distributional_checks.yml`
+(row-count volume, missing-coordinate rate, resolution-hours distribution, closure
+rate by cohort age, complaint-type composition drift, agency composition drift),
+every threshold traced to its measured 24-month range in `docs/decisions.md`, C3.4.
+Live scan result (run 2026-08-22, against the current bronze state — see note
+below): **5/6 PASSED, 1/6 FAILED**. The one failure (`Row-count volume for the most
+recent fully-settled-by-publish-lag day is within [4000, 28000]`) is real and
+explained, not a check defect: bronze's last ingested row is `2026-08-20 01:50:51`
+(no incremental run since the session interruption), so `created_date::date =
+today_ny - 2` (2026-08-20) contains only 345 rows — a partial day — against a
+[4000, 28000] band derived from full days. This is the check correctly detecting
+that bronze is stale relative to wall-clock time, not a defect in the underlying
+data; re-running after the next incremental ingestion is expected to pass.
+
+## Phase 3 (C3.5–C3.8; final, post-implementation numbers, 2026-08-23)
+
+**C3.5 — five detectors, all implemented as dbt models**
+(`dbt/models/marts/quality/dq_detector_*.sql`), each computing the full
+24-month backtest every run. Reproduced against the H3.2/H3.2b journal with
+two corrections found and fixed in the journal, not the code (full detail
+in `docs/decisions.md`):
+
+| Detector | Backtested firings | Correction from original journal entry |
+|---|---|---|
+| (a) Undated-closure rate (redesigned) | DHS: 25/25 monthly cumulative scans. DSNY: 10/25 (2025-04–2026-01, resolved, currently 0.0066% vs. 0.008705% threshold) | Journal originally claimed 0 non-DHS firings — never actually checked for the cumulative backtest; corrected |
+| (b) Composition-drift (YoY) | 2 of **194** evaluations (STREET CONDITION Mar 2026 +5.88pp; NOISE-RESIDENTIAL Jan 2026 −12.10pp) | Journal's back-of-envelope 195 assumed every top-15 type has nonzero volume every eligible month; one cell (WATER SYSTEM, partial Aug 2026) is empty |
+| (c) Vocabulary-drift | 2 new agencies (`OOS`, `NYC311-PRD`), 17/23 months with ≥1 new complaint type | None — matches exactly |
+| (d) Settlement-completeness | 0 fails/warns across 4 eligible cohorts (Feb 92.06%, Mar 92.98%, Apr 93.92%, **May 2026 95.25% — newly eligible since the journal was last written**, one day of wall-clock time having aged it past the 90-day mark) | None — matches, plus one new cohort as expected |
+| (e) Mass metadata-touch | 6 of 180 eligible nights (Dec 2025 migration 4.35M rows; 5 single-agency batch-volume nights) | None — matches exactly, including all 6 dates and row counts |
+
+**C3.6 — the DQ scorecard mart**, `fct_data_quality_checks`: **103 rows**
+on this run (8 contract + 7 unit + 6 distributional + 82 detector),
+incremental (accumulates one new row-set per `run_date`). DHS's
+permanently-firing detector (a) row carries `status='acknowledged'`
+(not `fail`), sourced from `dbt/seeds/quality_acknowledgments.csv`
+(acknowledged 2026-08-22) — the true measured value (17.2908%) stays
+visible, just recontextualized. The 6 live-recomputed distributional rows
+independently cross-check Soda's own 6 checks: both report the identical
+1-of-6 failure for the identical reason (stale bronze) on this run.
+
+**C3.7 — DHS exclusion, quantified.** 17,356 affected rows, `created_date`
+2024-08-19 through 2025-05-06 (America/New_York) — auditable directly via
+`fct_service_requests.is_undated_closure`. DHS's closure rate among settled
+requests: **80.97% including the backlog rows in the settled-not-closed
+bucket, 98.61% excluding them entirely — a +17.65 percentage point
+delta.** See `docs/findings.md` for the full statement.
+
+**C3.8 — suite duration, final.** `dbt build --profiles-dir . --target prod`
+(run from `dbt/`; 10 table models incl. 5 detectors + the scorecard, 3 view
+models, 1 seed, 72 data tests, 7 unit tests = 94 nodes): **13.9s**, 93 PASS
+/ 1 WARN (the known ~0.02% closed-before-created rate) / 0 ERROR.
+`quality/run_soda.py` (6 checks, run second — never overlapping `dbt
+build`, per the H3.1(c) lock-contention finding): **2.0s**. Full
+sequential suite: **~16s** — an order of magnitude under any Phase 6
+scheduling concern. One command, two necessarily-separate steps
+(`docs/decisions.md`, C3.8, states why merging them is not possible).

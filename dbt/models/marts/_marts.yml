@@ -173,6 +173,17 @@ models:
         data_type: boolean
         data_tests:
           - not_null
+      - name: is_undated_closure
+        data_type: boolean
+        description: >
+          status='Closed' but closed_date is null (C3.7) — 99.9% DHS, a
+          frozen historical backlog (17,356 rows, created 2024-08-19 through
+          2025-05-06). Any DHS closure-rate/SLA metric must state whether
+          these rows are included; excluding them changes DHS's apparent
+          closure rate by +17.65pp (80.97% -> 98.61%) — see
+          docs/decisions.md, C3.7.
+        data_tests:
+          - not_null
       - name: has_valid_coordinates
         data_type: boolean
         data_tests:
@@ -187,3 +198,39 @@ models:
         data_type: varchar
       - name: borough
         data_type: varchar
+
+  - name: fct_data_quality_checks
+    description: >
+      C3.6 — the DQ scorecard. Grain: one row per (check_name, grain,
+      run_date). Incremental so history accumulates across runs (trend,
+      not just current state). Four categories: contract, unit,
+      distributional, detector — see the model's own docstring for how
+      each is computed. Not contract-enforced: measured_value's meaning is
+      category-dependent by design (a rate, a row count, a delta in
+      percentage points), which a single enforced numeric type can't
+      usefully constrain further than "is a double."
+    columns:
+      - name: check_name
+        data_tests:
+          - not_null
+      - name: category
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['contract', 'unit', 'distributional', 'detector']
+      - name: grain
+        data_tests:
+          - not_null
+      - name: status
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['pass', 'warn', 'fail', 'acknowledged', 'info']
+      - name: run_date
+        data_tests:
+          - not_null
+      - name: run_timestamp
+        data_tests:
+          - not_null

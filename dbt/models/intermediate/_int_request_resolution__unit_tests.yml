@@ -1,0 +1,136 @@
+unit_tests:
+
+  - name: test_resolution_hours_normal_close
+    model: int_request_resolution
+    description: >
+      A request closed well within the settlement window computes a
+      straightforward positive resolution_hours.
+    given:
+      - input: ref('stg_service_requests')
+        rows:
+          - unique_key: 'unit-1'
+            created_date: "2026-01-01 00:00:00-05:00"
+            closed_date: "2026-01-03 00:00:00-05:00"
+            status: 'Closed'
+    expect:
+      rows:
+        - unique_key: 'unit-1'
+          is_closed: true
+          is_settled: true
+          is_censored: false
+          resolution_hours: 48
+
+  - name: test_resolution_hours_closed_before_created_defect
+    model: int_request_resolution
+    description: >
+      The known ~0.02% closed-before-created source defect (see
+      docs/decisions.md). Passed through as a negative value, not
+      suppressed or clipped to null/zero — suppressing it here would hide
+      exactly the finding the assert_closed_date_after_created_date test
+      is designed to surface downstream.
+    given:
+      - input: ref('stg_service_requests')
+        rows:
+          - unique_key: 'unit-2'
+            created_date: "2026-01-03 00:00:00-05:00"
+            closed_date: "2026-01-01 00:00:00-05:00"
+            status: 'Closed'
+    expect:
+      rows:
+        - unique_key: 'unit-2'
+          is_closed: true
+          is_settled: true
+          is_censored: false
+          resolution_hours: -48
+
+  - name: test_is_censored_for_open_request
+    model: int_request_resolution
+    description: An open request (no closed_date) is always censored, regardless of age.
+    given:
+      - input: ref('stg_service_requests')
+        rows:
+          - unique_key: 'unit-3'
+            created_date: "2020-01-01 00:00:00-05:00"
+            closed_date: null
+            status: 'Open'
+    expect:
+      rows:
+        - unique_key: 'unit-3'
+          is_closed: false
+          is_settled: true
+          is_censored: true
+          resolution_hours: null
+
+  - name: test_closed_but_not_yet_settled_yields_null_resolution
+    model: int_request_resolution
+    description: >
+      A request can be genuinely closed and still censored, if it hasn't
+      aged past the settlement window — must yield null resolution_hours,
+      not a value, even though a resolution time could technically be
+      computed. This is the case the two-flag design exists to distinguish
+      from a still-open request.
+    given:
+      - input: ref('stg_service_requests')
+        rows:
+          - unique_key: 'unit-4'
+            created_date: "{{ (modules.datetime.datetime.now() - modules.datetime.timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S') }}"
+            closed_date: "{{ modules.datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S') }}"
+            status: 'Closed'
+    expect:
+      rows:
+        - unique_key: 'unit-4'
+          is_closed: true
+          is_settled: false
+          is_censored: true
+          resolution_hours: null
+
+  - name: test_is_settled_at_exactly_45_day_boundary
+    model: int_request_resolution
+    description: >
+      is_settled uses <=, so a request created exactly
+      observation_cutoff_days (45) ago is settled — the boundary is
+      inclusive. Dates computed relative to "now" in America/New_York
+      (matching the model's own timezone-anchored comparison, fixed in
+      C3.3 — see docs/decisions.md) so this test does not depend on when
+      it happens to run.
+    given:
+      - input: ref('stg_service_requests')
+        rows:
+          - unique_key: 'unit-5'
+            created_date: "{{ modules.pytz.timezone('America/New_York').localize(modules.datetime.datetime.combine(modules.datetime.datetime.now(modules.pytz.timezone('America/New_York')).date() - modules.datetime.timedelta(days=45), modules.datetime.time(0, 0, 0))).strftime('%Y-%m-%d %H:%M:%S%z') }}"
+            closed_date: null
+            status: 'Open'
+    expect:
+      rows:
+        - unique_key: 'unit-5'
+          is_settled: true
+
+  - name: test_is_settled_one_day_short_of_boundary
+    model: int_request_resolution
+    description: A request created 44 days ago (one day short of the 45-day cutoff) is not yet settled.
+    given:
+      - input: ref('stg_service_requests')
+        rows:
+          - unique_key: 'unit-6'
+            created_date: "{{ modules.pytz.timezone('America/New_York').localize(modules.datetime.datetime.combine(modules.datetime.datetime.now(modules.pytz.timezone('America/New_York')).date() - modules.datetime.timedelta(days=44), modules.datetime.time(0, 0, 0))).strftime('%Y-%m-%d %H:%M:%S%z') }}"
+            closed_date: null
+            status: 'Open'
+    expect:
+      rows:
+        - unique_key: 'unit-6'
+          is_settled: false
+
+  - name: test_is_settled_one_day_past_boundary
+    model: int_request_resolution
+    description: A request created 46 days ago (one day past the 45-day cutoff) is settled.
+    given:
+      - input: ref('stg_service_requests')
+        rows:
+          - unique_key: 'unit-7'
+            created_date: "{{ modules.pytz.timezone('America/New_York').localize(modules.datetime.datetime.combine(modules.datetime.datetime.now(modules.pytz.timezone('America/New_York')).date() - modules.datetime.timedelta(days=46), modules.datetime.time(0, 0, 0))).strftime('%Y-%m-%d %H:%M:%S%z') }}"
+            closed_date: null
+            status: 'Open'
+    expect:
+      rows:
+        - unique_key: 'unit-7'
+          is_settled: true

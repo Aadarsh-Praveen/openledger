@@ -1,0 +1,2 @@
+check_name,grain,acknowledged_date,acknowledged_by,reason
+undated_closure_rate_anomaly,DHS,2026-08-22,H3.2/H3.2b review,"Frozen historical backlog: 17356 rows, created 2024-08-19 through 2025-05-06, zero growth since. Detector correctly fires every scan (persistent, by design) but is a known, bounded, unremediated condition rather than an active operational problem. See docs/decisions.md C3.5(a) and C3.7, docs/findings.md."

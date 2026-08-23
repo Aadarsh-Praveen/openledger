@@ -36,12 +36,40 @@ resolution as (
         -- closed_date to compute a resolution time from.
         (status = 'Closed' and closed_date is not null) as is_closed,
 
+        -- is_undated_closure (C3.7): status='Closed' but closed_date is
+        -- null — a request administratively closed without a resolution
+        -- date. Currently indistinguishable from a genuinely open request
+        -- by is_closed/is_censored alone (both are false/true the same way
+        -- for either case) — this flag exists so a consumer CAN
+        -- distinguish them. Found via C3.5's detector (a) redesign to be
+        -- 99.9% concentrated in one agency (DHS), a frozen historical
+        -- backlog (17,356 rows, created 2024-08-19 through 2025-05-06, no
+        -- growth since) rather than an ongoing condition — see
+        -- docs/decisions.md, C3.7, for the quantified effect on DHS's
+        -- apparent SLA/closure rate if this flag is not accounted for.
+        (status = 'Closed' and closed_date is null) as is_undated_closure,
+
         -- is_settled: created_date old enough that even a currently-open
         -- reading is trustworthy (per the measured completeness curve, not
         -- the C1.1 lag distribution — those are different quantities).
         -- Keys on created_date, never closed_date — see module docstring.
-        (created_date <= current_date - interval '{{ var("observation_cutoff_days") }} days')
-            as is_settled
+        --
+        -- Deliberately NOT bare `current_date`: that resolves against
+        -- DuckDB's *session* TimeZone setting, not this project's single
+        -- documented timezone assumption (created_date_timezone). Found in
+        -- C3.3: those two happen to coincide on this dev machine (session
+        -- TimeZone defaults to America/New_York here), which is exactly why
+        -- it went unnoticed — but a session running as UTC (the likely
+        -- default for Phase 6's CI runner) would resolve `current_date` to
+        -- the next calendar day for roughly 7-8 hours every evening Eastern
+        -- time, silently shifting the settled/censored boundary for any row
+        -- exactly 45 days old with no error anywhere. Anchoring explicitly
+        -- to created_date_timezone removes the dependency on session state.
+        (
+            created_date
+            <= timezone('{{ var("created_date_timezone") }}', current_timestamp)::date
+                - interval '{{ var("observation_cutoff_days") }} days'
+        ) as is_settled
 
     from staged
 
@@ -69,6 +97,7 @@ select
     is_closed,
     is_settled,
     is_censored,
+    is_undated_closure,
 
     -- Do not compute a resolution time for censored rows. Null is correct —
     -- a zero or imputed value would silently corrupt every downstream

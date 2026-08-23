@@ -1,0 +1,163 @@
+# C3.4 — distributional checks. "Watch shape, not nulls" (phase-3.md).
+#
+# Every threshold below is derived from a measured value across the full
+# 24-month history (2024-08-19 through the most recent complete month as of
+# this writing), not a round number — see docs/decisions.md's C3.4 entry for
+# the exact measurement query and observed range behind each one. Thresholds
+# are set with deliberate margin beyond the observed extremes, because the
+# observed extremes themselves are legitimate, explained events (a holiday
+# low, a snowstorm high, HPD's known winter heating surge) — not defects to
+# tighten against. Distinguishing "outside this generous band" from
+# "a recurring, expected seasonal swing" is C3.5's job, not this layer's.
+#
+# All six checks use Soda's "failed rows" mechanism with an explicit
+# fail query: the query returns a row only when the measured value is
+# outside its historical band, so zero rows returned means pass.
+
+checks for fct_service_requests:
+
+  # Observed daily range across 24 months: 6,216 (2025-12-25, Christmas) to
+  # 22,805 (2026-02-24, a snowstorm — SNOW OR ICE alone was 11,370 of that
+  # day's rows). Both are real, explained days, not defects.
+  #
+  # Uses today_ny - 2, not - 1: checked directly at write time and found
+  # today_ny - 1 still only 345 rows (vs. ~10,500 the day before) — a real,
+  # expected publish-lag effect (Phase 1's known finding that rows continue
+  # arriving/updating for a day or two after their created_date), not a
+  # volume anomaly. today_ny - 2 is reliably past that lag window.
+  - failed rows:
+      name: Row-count volume for the most recent fully-settled-by-publish-lag day is within the historical band [4000, 28000]
+      fail query: |
+        with recent_complete_day as (
+            select count(*) as n
+            from fct_service_requests
+            where created_date::date = '${today_ny}'::date - interval '2' day
+        )
+        select n from recent_complete_day where n < 4000 or n > 28000
+
+  # Observed monthly range across 24 months: 0.89% to 5.29% (the March 2026
+  # STREET CONDITION/pothole-surge month — see docs/findings.md C2.8 Q5).
+  - failed rows:
+      name: Missing-coordinate rate over the trailing 30 days is within the historical band [0.5%, 7.0%]
+      fail query: |
+        with trailing_window as (
+            select
+                round(100.0 * sum(case when not has_valid_coordinates then 1 else 0 end) / count(*), 2) as pct_missing
+            from fct_service_requests
+            where created_date >= '${today_ny}'::date - interval '30' day
+        )
+        select pct_missing from trailing_window where pct_missing < 0.5 or pct_missing > 7.0
+
+  # Observed monthly cohort range across 24 months: median 4-26 hours,
+  # p90 313-533 hours (highest median in Jan 2026, a heating-season +
+  # post-holiday-backlog month; lowest in the summer months). Cohort window
+  # (day 45-75) chosen so the cohort is fully settled at scan time.
+  - failed rows:
+      name: Median/p90 resolution_hours for a recently-settled cohort are within the historical band
+      fail query: |
+        with cohort as (
+            select resolution_hours
+            from fct_service_requests
+            where is_settled and is_closed and resolution_hours is not null
+              and created_date >= '${today_ny}'::date - interval '75' day
+              and created_date < '${today_ny}'::date - interval '45' day
+        ),
+        stats as (
+            select
+                round(median(resolution_hours), 1) as median_hrs,
+                round(quantile_cont(resolution_hours, 0.9), 1) as p90_hrs
+            from cohort
+        )
+        select median_hrs, p90_hrs from stats
+        where median_hrs < 2 or median_hrs > 35 or p90_hrs < 250 or p90_hrs > 600
+
+  # Observed monthly cohort range across 24 months: 94.07% to 99.16%. The
+  # lower end belongs to the most recently-settled cohorts specifically
+  # (consistent with completeness still climbing past the 45-day mark per
+  # docs/findings.md's measured ~93% completeness at day 45 — not a defect).
+  - failed rows:
+      name: Closure rate for a cohort at the settlement boundary is within the historical band [90%, 99.9%]
+      fail query: |
+        with cohort as (
+            select
+                round(100.0 * sum(case when is_closed then 1 else 0 end) / count(*), 2) as closure_rate_pct
+            from fct_service_requests
+            where is_settled
+              and created_date >= '${today_ny}'::date - interval '75' day
+              and created_date < '${today_ny}'::date - interval '45' day
+        )
+        select closure_rate_pct from cohort
+        where closure_rate_pct < 90 or closure_rate_pct > 99.9
+
+  # Max historical month-over-month share delta across the top 10 complaint
+  # types, full 24-month history: 9.79pp (NOISE - RESIDENTIAL), 8.94pp
+  # (HEAT/HOT WATER — the known seasonal mover). Threshold set with margin
+  # above the largest known-legitimate swing. Checked over the last 2
+  # calendar months so a single bad scan can't hide a real drift by
+  # happening to land between checks.
+  - failed rows:
+      name: No top-10 complaint type's month-over-month volume share moved beyond the historical swing band [15pp]
+      fail query: |
+        with top_types as (
+            select ct.complaint_type
+            from fct_service_requests f
+            join dim_complaint_type ct on f.complaint_type_key = ct.complaint_type_key
+            group by 1 order by count(*) desc limit 10
+        ),
+        monthly as (
+            select date_trunc('month', f.created_date) as month, ct.complaint_type, count(*) as n
+            from fct_service_requests f
+            join dim_complaint_type ct on f.complaint_type_key = ct.complaint_type_key
+            where ct.complaint_type in (select complaint_type from top_types)
+            group by 1, 2
+        ),
+        month_totals as (
+            select date_trunc('month', created_date) as month, count(*) as total
+            from fct_service_requests
+            group by 1
+        ),
+        shares as (
+            select m.month, m.complaint_type, m.n * 100.0 / t.total as pct_share
+            from monthly m join month_totals t on m.month = t.month
+        ),
+        deltas as (
+            select
+                complaint_type, month,
+                pct_share - lag(pct_share) over (partition by complaint_type order by month) as mom_delta
+            from shares
+        )
+        select complaint_type, month, mom_delta
+        from deltas
+        where mom_delta is not null
+          and abs(mom_delta) > 15
+          and month >= date_trunc('month', '${today_ny}'::date) - interval '2' month
+
+  # Max historical month-over-month share delta across all agencies, full
+  # 24-month history: 10.37pp (HPD — heating-season driven), 8.77pp (NYPD).
+  - failed rows:
+      name: No agency's month-over-month volume share moved beyond the historical swing band [15pp]
+      fail query: |
+        with monthly as (
+            select date_trunc('month', f.created_date) as month, a.agency, count(*) as n
+            from fct_service_requests f
+            join dim_agency a on f.agency_key = a.agency_key
+            group by 1, 2
+        ),
+        month_totals as (
+            select date_trunc('month', created_date) as month, count(*) as total
+            from fct_service_requests
+            group by 1
+        ),
+        shares as (
+            select m.month, m.agency, m.n * 100.0 / t.total as pct_share
+            from monthly m join month_totals t on m.month = t.month
+        ),
+        deltas as (
+            select agency, month, pct_share - lag(pct_share) over (partition by agency order by month) as mom_delta
+            from shares
+        )
+        select agency, month, mom_delta
+        from deltas
+        where mom_delta is not null
+          and abs(mom_delta) > 15
+          and month >= date_trunc('month', '${today_ny}'::date) - interval '2' month

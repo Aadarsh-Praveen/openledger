@@ -1,0 +1,59 @@
+version: 2
+
+models:
+  - name: dq_detector_undated_closure_rate
+    description: >
+      Detector (a) REDESIGNED (H3.2). Grain: one row per (agency,
+      scan_month) — the full 25-scan cumulative backtest, re-run every
+      build. See docs/decisions.md, C3.5(a) REDESIGNED.
+    columns:
+      - name: scan_month
+        data_tests: [not_null]
+      - name: agency
+        data_tests: [not_null]
+      - name: fired
+        data_tests: [not_null]
+
+  - name: dq_detector_mass_touch
+    description: >
+      Detector (e) (H3.2b). Grain: one row per eligible cross-agency hour
+      bucket (>=13 of 16 agencies touched). See docs/decisions.md, C3.5(e).
+    columns:
+      - name: hour_bucket
+        data_tests: [not_null, unique]
+      - name: fired
+        data_tests: [not_null]
+
+  - name: dq_detector_composition_drift
+    description: >
+      Detector (b). Grain: one row per (complaint_type, month) with a
+      valid same-calendar-month prior-year comparison. See
+      docs/decisions.md, C3.5(b).
+    columns:
+      - name: month
+        data_tests: [not_null]
+      - name: complaint_type
+        data_tests: [not_null]
+      - name: fired
+        data_tests: [not_null]
+
+  - name: dq_detector_vocabulary_drift
+    description: >
+      Detector (c). Grain: one row per (dimension, value) first seen after
+      the initial backfill month. Notification only. See
+      docs/decisions.md, C3.5(c).
+    columns:
+      - name: dimension
+        data_tests: [not_null]
+      - name: value
+        data_tests: [not_null]
+
+  - name: dq_detector_settlement_completeness
+    description: >
+      Detector (d). Grain: one row per eligible (>=90-day-old,
+      uncontaminated) cohort month. See docs/decisions.md, C3.5(d).
+    columns:
+      - name: cohort_month
+        data_tests: [not_null, unique]
+      - name: status
+        data_tests: [not_null]

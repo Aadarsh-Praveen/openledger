@@ -1,0 +1,42 @@
+# Pinned exactly as resolved by `pip freeze` on 2026-08-21 against Python 3.11.15,
+# installed into a SEPARATE venv (.venv-soda/, not .venv/) — soda-core-duckdb hard-pins
+# duckdb<1.1.0 (see docs/decisions.md, C3.1), incompatible with the main project's
+# duckdb 1.5.5 (requirements.txt). Do not merge into requirements.txt.
+#
+# duckdb==1.0.0 here vs. duckdb==1.5.5 in requirements.txt. Verified (C3.1) that
+# DuckDB 1.0.0 can read a database file written by DuckDB 1.5.5 — but that is a
+# fact about these two specific versions, checked empirically, not a guarantee that
+# holds across any future upgrade of either pin. See scripts/soda_scan.py's
+# compatibility assertion (C3.4/H3.1 requirement 2) for the runtime safety net.
+annotated-types==0.8.0
+antlr4-python3-runtime==4.11.1
+certifi==2026.7.22
+charset-normalizer==3.5.1
+click==8.4.2
+duckdb==1.0.0
+googleapis-common-protos==1.75.1
+idna==3.19
+inflect==7.5.0
+Jinja2==3.1.6
+MarkupSafe==3.0.3
+more-itertools==11.1.0
+opentelemetry-api==1.44.0
+opentelemetry-exporter-otlp-proto-common==1.44.0
+opentelemetry-exporter-otlp-proto-http==1.44.0
+opentelemetry-proto==1.44.0
+opentelemetry-sdk==1.44.0
+opentelemetry-semantic-conventions==0.65b0
+protobuf==7.36.0
+pydantic==2.13.4
+pydantic_core==2.46.4
+python-dotenv==1.2.3
+requests==2.34.2
+ruamel.yaml==0.17.40
+ruamel.yaml.clib==0.2.15
+soda-core==3.5.6
+soda-core-duckdb==3.5.6
+sqlparse==0.6.0
+typeguard==4.6.0
+typing-inspection==0.4.4
+typing_extensions==4.16.0
+urllib3==2.7.0

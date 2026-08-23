@@ -11,39 +11,139 @@ models:
       fields, and all date/timestamp columns except updated_at localized to
       America/New_York via the created_date_timezone var. In the dev target only,
       filtered to a recent slice via the dev_row_limit var.
+    config:
+      contract:
+        enforced: true
     columns:
       - name: unique_key
+        data_type: varchar
         description: Bronze's natural key; one row per unique_key at this grain.
         data_tests:
           - unique
           - not_null
       - name: created_date
+        data_type: timestamptz
         description: >
           Localized to America/New_York (see created_date_timezone var);
           the single documented timezone assumption for this project.
         data_tests:
           - not_null
       - name: closed_date
+        data_type: timestamptz
         description: Null while a request is open or unresolved.
+      - name: due_date
+        data_type: timestamptz
+      - name: resolution_action_updated_date
+        data_type: timestamptz
+        description: >
+          Source-side "last resolution update" signal, kept in staging (not
+          bronze-only) for its Phase 1 cross-check value.
+      - name: updated_at
+        data_type: timestamptz
+        description: Bronze's own upsert timestamp; deliberately not timezone-localized.
+        data_tests:
+          - not_null
       - name: agency
+        data_type: varchar
         description: Agency code (e.g. NYPD, HPD). Joins to dim_agency.
+      - name: agency_name
+        data_type: varchar
       - name: complaint_type
+        data_type: varchar
         description: Upper-cased and trimmed. Joins to dim_complaint_type with descriptor.
       - name: descriptor
+        data_type: varchar
         description: Upper-cased and trimmed; null descriptor is left null, not coalesced.
+      - name: descriptor_2
+        data_type: varchar
+      - name: location_type
+        data_type: varchar
+      - name: incident_zip
+        data_type: varchar
+      - name: incident_address
+        data_type: varchar
+      - name: street_name
+        data_type: varchar
+      - name: cross_street_1
+        data_type: varchar
+      - name: cross_street_2
+        data_type: varchar
+      - name: intersection_street_1
+        data_type: varchar
+      - name: intersection_street_2
+        data_type: varchar
+      - name: address_type
+        data_type: varchar
+      - name: city
+        data_type: varchar
+        description: Upper-cased and trimmed (real case variants measured — see docs/decisions.md).
+      - name: landmark
+        data_type: varchar
+      - name: facility_type
+        data_type: varchar
       - name: status
+        data_type: varchar
         description: Trimmed source status string (e.g. "Closed", "Open", "Assigned").
-      - name: borough
-        description: Upper-cased and trimmed. Joins to dim_location alongside community_board.
+      - name: resolution_description
+        data_type: varchar
       - name: community_board
+        data_type: varchar
         description: >
           Format "NN BOROUGH" (e.g. "12 BRONX"). Chosen as dim_location's key —
           see docs/decisions.md — because it already encodes borough + community
           district as one stable field.
+      - name: council_district
+        data_type: varchar
+      - name: police_precinct
+        data_type: varchar
+      - name: bbl
+        data_type: varchar
+      - name: borough
+        data_type: varchar
+        description: Upper-cased and trimmed. Joins to dim_location alongside community_board.
+      - name: x_coordinate_state_plane
+        data_type: double
+      - name: y_coordinate_state_plane
+        data_type: double
+      - name: open_data_channel_type
+        data_type: varchar
+      - name: park_facility_name
+        data_type: varchar
+      - name: park_borough
+        data_type: varchar
+        description: Verified 100.00% redundant with borough (see docs/decisions.md) — kept anyway, dropped past int_request_geography.
+      - name: vehicle_type
+        data_type: varchar
+      - name: taxi_company_borough
+        data_type: varchar
+      - name: taxi_pick_up_location
+        data_type: varchar
+      - name: bridge_highway_name
+        data_type: varchar
+      - name: bridge_highway_direction
+        data_type: varchar
+      - name: road_ramp
+        data_type: varchar
+      - name: bridge_highway_segment
+        data_type: varchar
+      - name: latitude
+        data_type: double
+        description: Canonical coordinate pair (see docs/decisions.md for the disagreement-rate check).
+      - name: longitude
+        data_type: double
       - name: has_valid_coordinates
+        data_type: boolean
         description: >
           True when latitude/longitude are both present and within NYC's bounding
           box and not exactly (0, 0). A boolean flag, never a row filter — missing
           coordinates reach ~1.7% of rows, out-of-bounds is ~0%.
         data_tests:
           - not_null
+      - name: computed_region_community_districts
+        data_type: double
+      - name: computed_region_borough_boundaries
+        data_type: double
+      - name: computed_region_police_precincts
+        data_type: double
+      - name: computed_region_city_council_districts
+        data_type: double
