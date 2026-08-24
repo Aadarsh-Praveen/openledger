@@ -154,3 +154,27 @@ now handled**:
    convenience example. Every `mf` invocation in this project's C4.2-C4.5
    work uses this exact command, with no other variant used anywhere.
    See `docs/decisions.md`, C4.1, for the full reproduction.
+
+## Phase 5 additions
+
+**`dashboard/package.json`** (npm, Node v20.19.0): `@evidence-dev/evidence@40.1.8`
+(MIT), `@evidence-dev/duckdb@^2.0.1`, `@evidence-dev/core-components@^5.4.2`,
+`@evidence-dev/tailwind@^3.1.4`, `@sveltejs/vite-plugin-svelte@3.1.2` —
+**pinned exactly, not a caret range**, because installing it unpinned
+resolves to a 7.x major requiring Vite 8 while the rest of the Evidence
+40.1.8 dependency tree is built against Vite 5.4, producing a build
+failure with no useful error message pointing at the version mismatch
+(`docs/decisions.md`, Phase 5, has the full symptom and fix). Plus
+`git-remote-origin-url@^4.0.0`, and `autoprefixer`/`postcss` as
+devDependencies.
+
+**A real product split found, not assumed**: the previously-documented
+scaffolding path, `npx degit evidence-dev/template`, now provisions a
+different, incompatible, hosted product ("Evidence Studio" — requires
+`evidence login`, defaults to a remote "Evidence Warehouse" backend).
+The classic, self-hosted, static-build tool this project's architecture
+requires still exists as a separately-installable, actively-maintained
+package (`@evidence-dev/evidence`, last published 2026-02-06) — confirmed
+via `npm view`, not assumed from the degit template's now-stale
+association with it. Scaffolded by hand instead of via the broken
+template.

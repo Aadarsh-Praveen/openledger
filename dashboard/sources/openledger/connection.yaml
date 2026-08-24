@@ -1,0 +1,4 @@
+name: openledger
+type: duckdb
+options:
+  filename: openledger.duckdb

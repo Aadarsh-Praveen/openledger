@@ -1,0 +1,1 @@
+select * from dq_resolution_hours_naive_vs_correct

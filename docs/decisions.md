@@ -3431,3 +3431,218 @@ results; 8 caught two real, would-have-shipped-silently bugs (a trap
 metric that was secretly a no-op, and a ratio numerator that produced
 impossible >100% rates) specifically *because* reconciliation was treated
 as a verification step, not a formality to wave through.
+
+---
+
+# Phase 5 — Evidence.dev Dashboard, Deployed Public
+
+## C5.1 — Build-time data delivery (resolved before any page was written)
+
+**Chosen: option 1, a small committed DuckDB file** — `dashboard/sources/openledger/openledger.duckdb`,
+built by `scripts/build_dashboard_source.py`, reading the full 596MB prod
+warehouse (read-only) and writing ONLY pre-aggregated tables — never raw
+fact rows. **Size: 2.26 MB** — trivially committable, no fetch-at-build-time
+mechanism needed.
+
+Ten tables, one per dashboard need, each computed with the EXACT SAME
+filter logic as the corresponding Phase 4 MetricFlow metric (not a
+re-derivation from scratch): `overview` (1 row), `agency_performance`
+(16 rows), `geo_equity` (57 rows, top-10 complaint types × borough),
+`geo_equity_missing_coords` (1 row), `seasonality` (230 rows, top-10
+types × complete months only — see the seasonality finding below),
+`dq_scorecard` (103 rows, a direct pull of the live Phase 3 scorecard),
+`dq_settlement_completeness` (4), `dq_vocabulary_drift` (398),
+`dq_mass_touch` (6, fired nights only), `dq_resolution_hours_naive_vs_correct` (1).
+
+**Connection confirmed working locally**: `evidence sources` (the classic
+Evidence CLI, via the `@evidence-dev/duckdb` connector,
+`dbt/sources/openledger/connection.yaml` → `filename: openledger.duckdb`)
+materializes all 10 as Parquet in one run, every table's row count
+matching what was written.
+
+**Reconciled against the full warehouse and MetricFlow independently,
+not just internally consistent with itself**: `overview`'s
+`request_count` (7,533,132), `median_resolution_hours` (8.0),
+`p90_resolution_hours` (401.0), `closure_rate_pct` (96.43%), and
+`settlement_rate_pct` (94.10%) all match `mf query`'s live output exactly.
+`agency_performance`'s DHS row (`naive_closure_rate_pct` 80.97%,
+`closure_rate_excl_backlog_pct` 98.60%) matches both `mf query` and
+C3.7's original hand-derived figures. Full detail in C5.6 below.
+
+## A real toolchain trap: the "official" Evidence template now scaffolds a different, incompatible product
+
+Before writing `scripts/build_dashboard_source.py`, tried the documented
+scaffolding path first: `npx degit evidence-dev/template`. **This is no
+longer the classic, self-hosted, static-build Evidence CLAUDE.md's plan
+requires** — the repo's own README now describes "Evidence Studio," a
+separate hosted product requiring `evidence login` (browser-based auth)
+and defaulting to a remote "Evidence Warehouse" backend unless a
+`connection.yaml` opts out — the opposite of the free, always-on,
+no-server static site this phase needs. **Verified this is a real product
+split, not a misreading**: the classic open-source package,
+`@evidence-dev/evidence` (npm, MIT, version 40.1.8, last published
+2026-02-06 — actively maintained, not abandoned), still exists
+separately, uses `@sveltejs/adapter-static` (confirmed via its own
+`package.json` dependencies), and exposes exactly the CLI this phase
+needs: `evidence dev`, `evidence build`, `evidence sources`, `evidence
+preview` — no login, no hosted warehouse. Scaffolded by hand instead of
+via `degit` (`dashboard/package.json` + `dashboard/evidence.config.yaml`
+written directly), since the templated starter no longer matches what
+this project needs.
+
+**Five real, undocumented dependency/environment issues found and fixed
+getting a first build to succeed, in the order hit** (kept in full,
+per this project's standing practice — this class of "the scaffold works
+until you actually run it" discovery is exactly what a future session or
+Phase 6's CI needs on record):
+1. `package.json` needs `"type": "module"` — omitted by default, and its
+   absence makes Node treat Evidence's ESM-only internals as CommonJS,
+   failing with "resolved to an ESM file" errors at every internal import.
+2. `@evidence-dev/tailwind` is a required peer, not bundled — build fails
+   with `Cannot find package '@evidence-dev/tailwind'` otherwise.
+3. Installing `@sveltejs/vite-plugin-svelte` without an explicit version
+   pin resolves to its LATEST major (7.x, which requires Vite 8) while
+   `@evidence-dev/evidence` itself is built against Vite 5.4 and
+   `@sveltejs/vite-plugin-svelte@3.1.2` specifically. The mismatch doesn't
+   error at install time (`--legacy-peer-deps` suppresses the conflict
+   warning) — it fails much later, deep in Vite's plugin system
+   (`Cannot read properties of undefined (reading 'config')`, because
+   `this.environment` — a Vite 6+ Rollup API — doesn't exist on Vite 5).
+   Fixed by pinning the exact compatible version, not just "a" version.
+4. `autoprefixer`/`postcss` are needed directly (not just as `tailwindcss`
+   transitive deps) for the project's PostCSS config to load.
+5. `git-remote-origin-url` is needed by an internal Evidence API route
+   (`api/settings.json`) that ships in every build regardless of whether
+   it's used.
+
+**Final, verified-working dependency set**: `dashboard/package.json`
+(`@evidence-dev/evidence@40.1.8`, `@evidence-dev/duckdb@^2.0.1`,
+`@evidence-dev/core-components@^5.4.2`, `@evidence-dev/tailwind@^3.1.4`,
+`@sveltejs/vite-plugin-svelte@3.1.2` exact, `git-remote-origin-url@^4.0.0`,
+`autoprefixer`/`postcss` as devDependencies) plus `dashboard/.npmrc`
+(`legacy-peer-deps=true`, so Vercel's own `npm install` — which would
+otherwise hit issue 3's ERESOLVE conflict — succeeds without a manual
+flag). **Verified from a fully clean install** (`rm -rf node_modules
+package-lock.json && npm install`, no flags) that this reproduces
+correctly — the exact scenario Vercel's build environment will run.
+
+## C5.2 — Evidence scaffold
+
+`dashboard/` — `evidence.config.yaml` (declares the `@evidence-dev/duckdb`
+datasource plugin and `@evidence-dev/core-components`),
+`sources/openledger/` (`connection.yaml` + one `.sql` file per pruned
+table, each a trivial `select * from <table>` — Evidence's convention:
+one source-directory `.sql` file per exposed dataset, named
+`<source>.<file_stem>` in pages), `pages/` (the 5 pages, C5.3).
+`npm run dev` and `npm run sources`/`npm run build` all confirmed working
+locally against the pruned source.
+
+## C5.3/C5.4/C5.5 — The five pages
+
+`pages/index.md` (Overview), `agency-performance.md`,
+`geographic-equity.md`, `seasonality.md`, `data-quality.md`. Naive-vs-correct
+shown prominently, not buried: the DHS backlog pair
+(`naive_closure_rate_pct` 80.97% vs. `closure_rate_excl_backlog_pct`
+98.60%) on Agency Performance, and the settlement/censoring pair (7 vs. 8
+median hours) on Data Quality — matching Phase 4's own relabeling of
+which trap each pair demonstrates. Honesty annotations: the ~1.72%
+missing-coordinate exclusion stated on Geographic Equity, provisional-
+period framing built into every resolution metric's own definition
+(settled-only, inherited from Phase 4, not re-derived per page).
+
+**A real honesty-annotation finding, caught while reconciling the
+seasonality page (C5.6), not anticipated going in**: the naive
+month-over-month volume range across the FULL raw data is 119,270 (Aug
+2024) to 348,511 (Jan 2026) — a range that looks far less flat than the
+page's own "volume barely moves" claim. Investigated rather than
+softened: Aug 2024 is the backfill's own partial start month (data begins
+2024-08-19, not the 1st) and the dataset's current last month is a
+partial, stale-bronze end (bronze's last ingested row is 2026-08-20).
+Excluding just those two calendar months, the range is 255,364-348,511 —
+genuinely flat-ish, matching the claim. **Fixed at the source**:
+`scripts/build_dashboard_source.py`'s `seasonality` query now excludes
+the calendar month containing the dataset's min and max `created_date`
+from every chart on that page, with an `<Alert>` on the page itself
+stating the exclusion and why — plotting the two partial months
+unfiltered would have visually manufactured a "volume crashes at both
+ends" story the underlying data doesn't support.
+
+## C5.6 — Reconciliation
+
+Every page's headline figure checked against a hand-written query on the
+**full** 7,533,132-row prod warehouse (not the pruned source, not
+MetricFlow — a third, fully independent path):
+
+| Page | Headline figure | Pruned/dashboard value | Full-warehouse hand-written value | Match |
+|---|---|---:|---:|---|
+| Overview | `request_count` | 7,533,132 | 7,533,132 | ✅ |
+| Overview | `median_resolution_hours` | 8.0 | 8.0 | ✅ |
+| Overview | `closure_rate_pct` | 96.4265% | 96.43% (rounded) | ✅ |
+| Agency Performance | DHS `naive_closure_rate_pct` | 80.973% | 80.97% (`mf query`, matches C3.7) | ✅ |
+| Agency Performance | DHS `closure_rate_excl_backlog_pct` | 98.6002% | 98.60% (`mf query`, matches C3.7) | ✅ |
+| Geographic Equity | missing-coordinate rate | (page states ~1.72%) | 1.72% | ✅ |
+| Seasonality | HEAT/HOT WATER peak monthly share | (page states "over 20%") | 22.93% | ✅ |
+| Data Quality | naive/correct median resolution hours | 7 / 8 | 7.0 / 8.0 (`mf query`, matches C4.4) | ✅ |
+
+**0 discrepancies.** The seasonality finding above was caught specifically
+*while doing this reconciliation* (the raw min/max didn't match the
+page's own flat-volume claim until the two partial months were
+identified) — direct evidence this step is a real check, not a formality.
+
+## C5.7 — Build and deploy (prepared; H5.1 is the user's account-level step)
+
+`dashboard/vercel.json`: `buildCommand: "npm run sources && npm run build"`
+(regenerates Parquet from the committed pruned DuckDB, then the static
+site — both from source, nothing pre-built is committed),
+`outputDirectory: "build"`, `framework: null` (disables Vercel's
+SvelteKit auto-detection, which would otherwise assume the serverless
+Vercel adapter rather than the static one this project actually uses).
+**Verified this exact command sequence locally, from a clean install,
+before handing off** — the same thing Vercel's build environment will run.
+
+**For H5.1**: connect the GitHub repo, set the Vercel project's **Root
+Directory to `dashboard`** (the repo is a monorepo; `vercel.json` and
+`package.json` both live there, not at the repo root), deploy, then
+confirm the public URL loads anonymously in a private browser window.
+
+## C5.8 — The refresh story
+
+**Full path**: (1) `python3 scripts/build_dashboard_source.py` — rebuilds
+`openledger.duckdb` from the current prod marts; (2) commit the
+regenerated file (it's small, ~2MB, a real diff each time); (3) push —
+Vercel's git integration rebuilds automatically on push to the connected
+branch, running `vercel.json`'s `buildCommand` (which itself re-runs
+`evidence sources` against the newly-committed DuckDB file, so the
+Parquet the site actually serves is always regenerated from the latest
+committed data, never stale build output). Step (3) can alternatively be
+a Vercel **deploy hook** (a webhook URL, created in the Vercel project's
+settings) fired by Phase 6's cron after step (2)'s commit, without
+needing a new git push per se — full wiring is Phase 6's job.
+
+**Proven once, locally, for real** (not merely described): steps (1) and
+the `evidence sources`/`evidence build` portion of what a rebuild does
+were run twice in this session for two different real reasons — the
+seasonality edge-month fix, and the date-formatting fix — both times
+producing a correctly updated `build/` output from a single script
+invocation plus the two `npm run` commands. **What could not be proven
+this session**: the actual Vercel redeploy trigger, since no Vercel
+project exists yet (H5.1 creates it). Once H5.1 is done, proving the full
+loop once (edit pruned source → rebuild → push → confirm the live site
+updates) is a single additional check, not new engineering.
+
+## STOP GATE 5 — status (Claude Code side; H5.1/H5.2 are the user's)
+
+| # | Criterion | Status | Evidence |
+|---|---|---|---|
+| 1 (load-bearing) | Build-time data path works | ✅ | 2.26MB pruned DuckDB, `evidence sources` confirmed materializing all 10 tables |
+| 2 | Pruned data reconciles to marts | ✅ | C5.1/C5.6, 0 discrepancies |
+| 3 | All five pages render locally | ✅ | `evidence build` clean, all 5 pages verified for real rendered content |
+| 4 | Naive-vs-correct shown | ✅ | DHS backlog pair (Agency Performance), settlement pair (Data Quality) |
+| 5 | Provisional metrics annotated | ✅ | Missing-coordinate note, seasonality partial-month exclusion + alert, settled-only filters inherited from Phase 4 |
+| 6 (load-bearing) | Headline numbers reconcile | ✅ | C5.6 table, 0 discrepancies, caught one real finding (seasonality edge months) in the process |
+| 7 (load-bearing) | Deployed and public | **pending H5.1** | Deploy config prepared and locally proven; needs the user's Vercel account |
+| 8 | All pages render live | pending H5.1 | Cannot confirm live rendering without a live deployment |
+| 9 | Ninety-second test passed | pending H5.2 | The user's subjective judgment |
+| 10 | Refresh path documented and proven once | partial | Local rebuild half proven twice; the Vercel-redeploy half needs H5.1's project to exist first |
+| 11 | Journal, metrics updated; URL in README stub | partial | This entry + `docs/metrics.md`; README stub written with a placeholder pending the live URL |
+| 12 | One atomic commit | not yet | After H5.1/H5.2, per C5.9 |

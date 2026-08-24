@@ -8,6 +8,8 @@ raw/*
 state/*
 !state/.gitkeep
 *.duckdb
+*.duckdb.wal
+!dashboard/sources/openledger/openledger.duckdb
 __pycache__/
 *.pyc
 .venv/
@@ -17,3 +19,12 @@ logs/
 dbt_packages/
 .user.yml
 .DS_Store
+
+# Phase 5 — dashboard/: node_modules and Evidence's own build artifacts are
+# reproducible from package.json + sources/, so not committed. The pruned
+# openledger.duckdb (~2MB, exception above) and package-lock.json ARE
+# committed — the whole point of C5.1 is that the data path is small enough
+# to commit, and the lockfile is what makes Vercel's install reproducible.
+dashboard/node_modules/
+dashboard/.evidence/
+dashboard/build/

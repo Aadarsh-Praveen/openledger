@@ -442,3 +442,40 @@ manually — the same class of bug as the Phase 3 unit-test date staleness,
 now confirmed to also affect semantic-layer metric removals, not just
 Jinja `datetime.now()` re-renders. Reinforces the existing Phase 6
 scheduling note (`docs/decisions.md`, C3.3/C4.6).
+
+## Phase 5 (Evidence.dev dashboard; Claude-Code-side numbers, 2026-08-24 — deploy/H5.1/H5.2 pending)
+
+**C5.1 — pruned data source**: **2.26 MB** (`dashboard/sources/openledger/openledger.duckdb`),
+10 tables, built from the 596MB full prod warehouse by
+`scripts/build_dashboard_source.py`. 0 raw fact rows in the pruned file —
+every table is pre-aggregated.
+
+**C5.2/C5.3 — pages**: **5** (`index` / Overview, `agency-performance`,
+`geographic-equity`, `seasonality`, `data-quality`), all confirmed
+rendering real data locally.
+
+**C5.6 — reconciliation**: 8 headline figures checked against the full
+warehouse independently of the pruned source and of MetricFlow — **0
+discrepancies**. One real finding surfaced by doing this (not a
+discrepancy in the numbers themselves, a discrepancy between the raw data
+and the page's own claim): the seasonality page's naive volume range
+(119,270-348,511) didn't match its "volume barely moves" framing until
+the two partial edge months (backfill-start Aug 2024, stale-bronze-end
+Aug 2026) were excluded, after which the range is 255,364-348,511. Fixed
+at the source query, not hidden.
+
+**Build timing** (`npm run sources && npm run build`, the exact Vercel
+build command, timed from a clean `.evidence`/`build` state): **sources
+1.6s + site build 24.7s = 26.3s total.**
+
+**Dependency-resolution finding**: five undocumented peer-dependency/
+environment requirements found getting the classic (non-"Evidence
+Studio") toolchain to build at all — full list in `docs/decisions.md`,
+Phase 5. Verified reproducible from a clean `npm install` (no manual
+flags, relying on a committed `.npmrc`) — the same install path Vercel's
+build environment will use.
+
+**Pending H5.1/H5.2** (the user's account-level steps): live public URL,
+anonymous-load confirmation, all-pages-render-live check, the ninety-second
+test, and the full refresh-loop proof (local half already proven twice
+this session; the Vercel-redeploy half needs the project to exist first).
