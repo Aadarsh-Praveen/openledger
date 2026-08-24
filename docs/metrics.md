@@ -383,3 +383,62 @@ build`, per the H3.1(c) lock-contention finding): **2.0s**. Full
 sequential suite: **~16s** — an order of magnitude under any Phase 6
 scheduling concern. One command, two necessarily-separate steps
 (`docs/decisions.md`, C3.8, states why merging them is not possible).
+
+## Phase 4 (MetricFlow semantic layer; final, post-H4.2 numbers, 2026-08-23)
+
+**C4.1 — toolchain**: `dbt-metricflow==0.14.0` + `metricflow==0.212.0`,
+both Apache-2.0, installed into the main venv (no conflict, unlike Soda).
+No dbt Cloud involved (confirmed via environment + traceback inspection).
+
+**C4.2 — semantic models**: **5** (`sm_service_requests` over the fact,
+grain one row per `unique_key`; `sm_agency`, `sm_complaint_type`,
+`sm_location`, `sm_date` over the four dimensions). `mf validate-configs`:
+all 6 validation passes green (manifest parse, semantic model, dimension,
+entity, measure, metric — the last four against the live DuckDB
+warehouse, not just the YAML).
+
+**C4.3/H4.2 — metrics**: **13 registered, 9 are real analytical
+deliverables** (`median_resolution_hours`, `p90_resolution_hours`,
+`closure_rate`, `settlement_rate`, `censored_count`, `request_count`,
+`naive_median_resolution_hours`, `naive_closure_rate`,
+`closure_rate_excl_backlog`); 4 exist only as ratio-metric plumbing
+(`closed_count`, `closed_and_settled_count`, `settled_count`,
+`settled_count_excl_backlog`). `complaint_type_share` removed at H4.2
+(confirmed non-functional — returns 1.0 for every group; no
+percent-of-total metric type in this MetricFlow version).
+
+**C4.4 — correctness invariant**: proven at the SQL-generation level, not
+just by querying and eyeballing. Read generated SQL for
+`median_resolution_hours` across 3 group-by shapes (by agency, by month,
+none) — the filter predicate is character-for-character identical and in
+the identical structural position (inside the row-level projection,
+before any `GROUP BY`) in all three.
+
+**C4.4/H4.2 — naive-vs-correct, two verified pairs, two different traps**:
+
+| Pair | Trap exposed | Correct | Naive | Gap |
+|---|---|---:|---:|---:|
+| `median_resolution_hours` vs `naive_median_resolution_hours` | Settlement/censoring (survivorship bias) | 8.00h | 7.00h | −1.00h (~12.5% relative), dataset-wide |
+| `closure_rate_excl_backlog` vs `naive_closure_rate` | Undated-closure backlog | 98.60% | 80.97% | **+17.63pp, DHS specifically** (matches C3.7's independently-derived 80.97%/98.61% almost exactly) |
+
+Both pairs verified to actually differ before being finalized — the first
+draft of each did NOT (the resolution-hours draft used the already-
+censored `resolution_hours` column, silently identical to the correct
+measure, 0 disagreeing rows; the closure-rate draft used an unnested
+`closed_count` numerator, producing impossible >100% rates for several
+agencies). Both root causes found and fixed before shipping, not after.
+
+**C4.5 — reconciliation**: 9 real metrics × (dataset-wide + all 16
+agencies) queried via MetricFlow and cross-checked against independent
+hand-written DuckDB SQL. **0 discrepancies** across every value checked,
+on the corrected definitions.
+
+**C4.6 — interface doc**: `docs/metrics_interface.md`.
+
+**A second occurrence of Phase 3's partial-parse staleness finding**:
+removing `complaint_type_share` and rebuilding did not remove it from
+`mf list metrics` until `target/partial_parse.msgpack` was deleted
+manually — the same class of bug as the Phase 3 unit-test date staleness,
+now confirmed to also affect semantic-layer metric removals, not just
+Jinja `datetime.now()` re-renders. Reinforces the existing Phase 6
+scheduling note (`docs/decisions.md`, C3.3/C4.6).

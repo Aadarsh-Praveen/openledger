@@ -95,3 +95,62 @@ see `docs/decisions.md`, C3.4) rather than relying on this table staying accurat
 
 Full pinned list for the Soda environment, with the same "why separate" rationale,
 lives in `requirements-soda.txt`.
+
+## Phase 4 additions
+
+**MetricFlow, installed into the main venv — no separate environment needed**,
+unlike Soda. `metricflow==0.212.0` was already a transitive dependency of
+`dbt-core==1.12.3` (used internally for manifest parsing); `dbt-metricflow==0.14.0`
+(the separate package providing the actual `mf` CLI) was resolved with
+`pip install --dry-run` first — zero conflicts against the existing
+`dbt-core<1.13,>=1.11` / `dbt-duckdb==1.11.0` pins, confirmed before installing
+for real. 5 small new transitive deps (`halo`, `log-symbols`, `spinners`,
+`termcolor`, `update-checker` — all CLI-spinner-related, non-load-bearing).
+
+**License, confirmed via `pip show`, not assumed from the plan's claim**:
+both `metricflow` and `dbt-metricflow` report `License-Expression: Apache-2.0`.
+
+**Confirmed: no dbt Cloud account or credentials involved.** `mf` (the CLI
+entry point `dbt_metricflow.cli.main:cli`) queries directly against dbt-core's
+own compiled `target/semantic_manifest.json` and runs SQL through dbt-duckdb's
+adapter connection — the same local DuckDB file dbt itself builds, no network
+call to any dbt Labs service. No `DBT_CLOUD_*` environment variables exist
+anywhere in this project's environment (checked directly).
+
+**Two real toolchain requirements found, neither obvious from the plan, both
+now handled**:
+1. **A time spine is mandatory** — `mf` refuses to run anything ("At least
+   one time spine must be configured to use the semantic layer") until one
+   model is designated via `time_spine: standard_granularity_column: <col>`
+   config. `dim_date` (already a full one-row-per-day calendar, 2024-08-19
+   through 2027-12-31) was reused for this rather than building a duplicate
+   spine model — `calendar_date` is already exactly what a time spine needs.
+2. **`mf` does not take `--target`/`--profiles-dir` CLI flags the way `dbt`
+   does.** It resolves the target via the `DBT_TARGET` environment variable
+   (defaulting to `profiles.yml`'s own `target:` if unset) — and critically,
+   **that target must match whatever target the manifest was last parsed
+   with**, or `mf query` fails at runtime with a DuckDB catalog-not-found
+   error (`Catalog "openledger_prod" does not exist!"`) — not a MetricFlow
+   bug, but a real mismatch: the compiled SQL has the parse-time target's
+   catalog name baked in as a literal, while `mf`'s own connection opens
+   whatever target it resolves separately, and DuckDB catalog names are
+   database-file-specific (`openledger_prod` vs `openledger_dev`).
+
+   **The single sanctioned invocation, and only this one — no manual
+   variant** (a cwd-based default without `DBT_PROFILES_DIR` was tested and
+   does also work when run from `dbt/`, but is deliberately NOT used or
+   documented as an alternative: a scheduled job silently picking up
+   whichever variant someone happened to type is exactly how the
+   catalog-mismatch failure above reaches production undetected — see
+   H4.2 review):
+   ```
+   DBT_TARGET=prod DBT_PROFILES_DIR=. mf query --metrics <...> [...]
+   ```
+   run from the `dbt/` directory, immediately after `dbt build
+   --profiles-dir . --target prod` (or any `dbt parse`/`dbt build` with
+   the same `--target prod`) — same explicit `--profiles-dir .` this
+   project already always uses for `dbt` itself. **This exact form is
+   what Phase 6's scheduled job must invoke, unchanged** — it is not a
+   convenience example. Every `mf` invocation in this project's C4.2-C4.5
+   work uses this exact command, with no other variant used anywhere.
+   See `docs/decisions.md`, C4.1, for the full reproduction.

@@ -1,0 +1,249 @@
+version: 2
+
+# C4.2 — semantic models over the marts. H4.1-approved toolchain
+# (docs/decisions.md). NOT yet canonical metrics — those are in
+# _metrics.yml (C4.3), pending H4.2 approval.
+#
+# One semantic model per mart, entities matching the fact's own foreign
+# key column names exactly (no expr remapping needed) so MetricFlow joins
+# them automatically. Descriptive/categorical attributes (agency name,
+# complaint_type, borough, calendar fields) are exposed ONLY through their
+# dimension table's semantic model, never duplicated onto the fact — two
+# reachable paths to the "same" attribute (e.g. a fact-level borough
+# column AND dim_location's borough) would be exactly the kind of
+# ambiguity that could make a filter or a join compose differently
+# depending on which path a query happens to take. The fact's own
+# dimensions are limited to attributes that are properties of the request
+# itself, not of a related entity: status and the four boolean flags.
+
+semantic_models:
+
+  - name: sm_service_requests
+    description: >
+      Grain: one row per unique_key, matching fct_service_requests exactly
+      (verified by that model's own unique/not_null tests — this semantic
+      model adds no new grain claim, it inherits the fact's).
+    model: ref('fct_service_requests')
+    defaults:
+      agg_time_dimension: created_date
+    entities:
+      - name: unique_key
+        type: primary
+      - name: agency_key
+        type: foreign
+      - name: complaint_type_key
+        type: foreign
+      - name: location_key
+        type: foreign
+      - name: date_key
+        type: foreign
+    dimensions:
+      - name: created_date
+        type: time
+        type_params:
+          time_granularity: day
+      - name: status
+        type: categorical
+        expr: status
+      - name: is_closed
+        type: categorical
+        expr: is_closed
+      - name: is_settled
+        type: categorical
+        expr: is_settled
+      - name: is_censored
+        type: categorical
+        expr: is_censored
+      - name: is_undated_closure
+        type: categorical
+        expr: is_undated_closure
+    measures:
+      - name: request_count_measure
+        description: Count of all requests, no filter. Backs request_count (C4.3).
+        agg: count
+        expr: unique_key
+
+      - name: closed_count_measure
+        description: Count where is_closed. Backs closure_rate's numerator (C4.3).
+        agg: count
+        expr: case when is_closed then unique_key else null end
+
+      - name: settled_count_measure
+        description: Count where is_settled. Backs settlement_rate's numerator (C4.3).
+        agg: count
+        expr: case when is_settled then unique_key else null end
+
+      - name: closed_and_settled_count_measure
+        description: >
+          Count where is_closed AND is_settled — a real bug found and
+          fixed verifying naive_closure_rate before shipping it (H4.2
+          review, task 3): closed_count_measure alone (is_closed with no
+          is_settled restriction) is NOT a subset of settled_count_measure
+          — a row can be closed but not yet settled (closed within the
+          last observation_cutoff_days) — so closed_count /
+          settled_count produced rates over 1.0 (e.g. 102.5% dataset-wide
+          on the first attempt), an impossible value that would have
+          shipped silently if not checked against a hand-written query.
+          This measure is the correctly NESTED numerator for any
+          settled-denominator ratio (naive_closure_rate,
+          closure_rate_excl_backlog): is_closed and is_undated_closure
+          are still mutually exclusive by construction, so this measure
+          serves as the numerator for both metrics unchanged — only their
+          denominators differ.
+        agg: count
+        expr: case when is_closed and is_settled then unique_key else null end
+
+      - name: settled_count_excl_backlog_measure
+        description: >
+          Count where is_settled AND NOT is_undated_closure — the
+          settled population with the DHS-style undated-closure backlog
+          removed entirely, not merely left uncredited as "not closed."
+          Backs closure_rate_excl_backlog's denominator (C4.3, H4.2
+          redesign). closed_count_measure is reused unchanged as this
+          metric's numerator too: is_closed and is_undated_closure are
+          mutually exclusive by construction (closed_date can't be both
+          null and not-null), so no undated-closure row was ever counted
+          in the numerator either way — only the denominator changes
+          between this and settled_count_measure.
+        agg: count
+        expr: case when is_settled and not is_undated_closure then unique_key else null end
+
+      - name: censored_count_measure
+        description: >
+          Count where is_censored (reuses the existing, tested C2/C3 flag —
+          not is_closed OR not is_settled — rather than inventing a
+          narrower "open only" definition that would silently diverge from
+          it). Backs censored_count (C4.3).
+        agg: count
+        expr: case when is_censored then unique_key else null end
+
+      - name: resolution_hours_correct_measure
+        description: >
+          C4.3's core correctness invariant, enforced HERE, inside the
+          measure's own expr — not as a separate metric-level filter. The
+          CASE WHEN nulls out every excluded row's resolution_hours BEFORE
+          any aggregation ever runs, for every single row independently of
+          how a query groups or slices the result. A percentile/median
+          aggregate skips nulls by construction, so an excluded row can
+          never contribute a value to this measure under ANY group-by —
+          there is no separate WHERE/HAVING clause MetricFlow could place
+          differently depending on grain, because the filter is fused to
+          the column reference itself, inside the aggregate function.
+          Backs median_resolution_hours and p90_resolution_hours (C4.3).
+        agg: median
+        expr: >
+          case
+            when is_settled and is_closed and not is_undated_closure
+            then resolution_hours
+            else null
+          end
+
+      - name: resolution_hours_correct_p90_measure
+        description: Same filtered expr as resolution_hours_correct_measure, agg=percentile(0.9) instead of median.
+        agg: percentile
+        expr: >
+          case
+            when is_settled and is_closed and not is_undated_closure
+            then resolution_hours
+            else null
+          end
+        agg_params:
+          percentile: 0.9
+          use_discrete_percentile: false
+          use_approximate_percentile: false
+
+      - name: resolution_hours_naive_measure
+        description: >
+          EXPOSES THE SETTLEMENT/CENSORING TRAP SPECIFICALLY — NOT the DHS
+          backlog trap (relabeled at H4.2 review; see docs/decisions.md
+          and docs/findings.md for the full correction). An EARLIER draft
+          used the pre-computed resolution_hours column, expecting it to
+          be "the wrong number." Verified directly and found that
+          column's null pattern is bit-for-bit identical to the correct
+          measure's own filter (0 disagreeing rows, checked directly) —
+          int_request_resolution.sql's own is_censored logic already
+          nulls it out everywhere the correct filter would too, so that
+          draft was silently not a trap at all. Fixed to recompute
+          duration from the RAW columns directly, bypassing the
+          already-safe resolution_hours column — what an analyst unaware
+          of int_request_resolution's censoring logic would actually
+          write. This still naturally excludes open/undated-closure rows
+          (NULL closed_date -> NULL date_diff, an accident of NULL
+          arithmetic that happens to exclude the DHS backlog from THIS
+          measure too, not an argument that the backlog doesn't matter —
+          see naive_closure_rate for the metric where it does) but
+          INCLUDES closed-but-unsettled rows, which is where this
+          measure's real, demonstrated gap comes from (the
+          publish-lag/survivorship bias trap) — and the rare
+          closed-before-created defect rows, uncapped. Label wherever
+          displayed as the wrong number.
+        agg: median
+        expr: date_diff('hour', created_date, closed_date)
+
+  - name: sm_agency
+    description: "Grain: one row per agency_key, matching dim_agency."
+    model: ref('dim_agency')
+    entities:
+      - name: agency_key
+        type: primary
+    dimensions:
+      - name: agency
+        type: categorical
+      - name: agency_name
+        type: categorical
+
+  - name: sm_complaint_type
+    description: "Grain: one row per complaint_type_key, matching dim_complaint_type."
+    model: ref('dim_complaint_type')
+    entities:
+      - name: complaint_type_key
+        type: primary
+    dimensions:
+      - name: complaint_type
+        type: categorical
+      - name: descriptor
+        type: categorical
+
+  - name: sm_location
+    description: "Grain: one row per location_key, matching dim_location."
+    model: ref('dim_location')
+    entities:
+      - name: location_key
+        type: primary
+    dimensions:
+      - name: community_board
+        type: categorical
+      - name: borough
+        type: categorical
+
+  - name: sm_date
+    description: >
+      Grain: one row per calendar day, matching dim_date. Also this
+      project's designated time spine (see the model's own config in
+      _marts.yml) — the two roles are independent: this section declares
+      it as a normal joinable dimension table (reachable via date_key from
+      the fact), separate from its time-spine role in granularity
+      conversion.
+    model: ref('dim_date')
+    entities:
+      - name: date_key
+        type: primary
+    dimensions:
+      - name: calendar_date
+        type: time
+        type_params:
+          time_granularity: day
+      - name: calendar_year
+        type: categorical
+        expr: year
+      - name: calendar_quarter
+        type: categorical
+        expr: quarter
+      - name: month_name
+        type: categorical
+      - name: day_name
+        type: categorical
+      - name: is_weekend
+        type: categorical
+      - name: season
+        type: categorical

@@ -67,6 +67,8 @@ models:
   - name: dim_date
     description: >
       Grain: one row per calendar day, 2024-08-19 through 2027-12-31 (1,230 rows).
+    time_spine:
+      standard_granularity_column: calendar_date
     config:
       contract:
         enforced: true
@@ -78,6 +80,7 @@ models:
           - not_null
       - name: calendar_date
         data_type: date
+        granularity: day
         data_tests:
           - not_null
       - name: year

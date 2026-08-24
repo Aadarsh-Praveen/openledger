@@ -1,0 +1,192 @@
+version: 2
+
+# C4.3 — the metrics. Approved at H4.2 (2026-08-23) for the 9 metrics
+# below, with two changes made as part of that approval:
+#   1. complaint_type_share (returned 1.0 for every group — no working
+#      "percent of parent total" metric type in this MetricFlow version)
+#      REMOVED. Share-of-total will be computed in Phase 5's query/
+#      dashboard layer instead: request_count queried grouped by
+#      complaint_type, divided by a separately-queried ungrouped total.
+#      See docs/decisions.md, C4.3, for the full limitation writeup.
+#   2. naive_median_resolution_hours' own DHS measurement (median 8.0h,
+#      identical either way — see docs/decisions.md, C4.4) showed it can
+#      only ever demonstrate the SETTLEMENT/censoring trap, never the
+#      backlog trap, because undated-closure rows self-exclude from any
+#      resolution-hours computation via null arithmetic regardless of
+#      filtering. naive_closure_rate / closure_rate_excl_backlog ADDED
+#      specifically to carry the backlog trap instead — two traps, two
+#      metric pairs, each demonstrated to actually differ (not assumed).
+#
+# Every resolution-time metric's correctness filter lives in the
+# underlying MEASURE's expr (_semantic_models.yml), not here as a
+# metric-level `filter:` — see that file's comment on
+# resolution_hours_correct_measure for why: a CASE WHEN fused to the
+# aggregate's own input column cannot be relocated relative to the
+# aggregation by MetricFlow's query composition, regardless of grain.
+# C4.4 proves this by reading the generated SQL for two different
+# group-bys and confirming the filter is in the same place in both.
+
+metrics:
+
+  # --- Resolution-time metrics (settled + closed only, backlog excluded) ---
+
+  - name: median_resolution_hours
+    description: >
+      Median hours from created_date to closed_date, filtered to
+      is_settled AND is_closed AND NOT is_undated_closure (baked into
+      resolution_hours_correct_measure's own expr, not a metric-level
+      filter — see _semantic_models.yml). Cannot include a censored,
+      unsettled, or DHS-backlog row under any group-by.
+    type: simple
+    type_params:
+      measure: resolution_hours_correct_measure
+
+  - name: p90_resolution_hours
+    description: Same filter as median_resolution_hours; 90th percentile instead of median.
+    type: simple
+    type_params:
+      measure: resolution_hours_correct_p90_measure
+
+  # --- Coverage metrics (the companions that keep latency honest) ---
+  #
+  # A `ratio` metric's numerator/denominator reference other METRICS, not
+  # measures directly (found the hard way — dbt parse rejected a
+  # measure-name reference outright; PydanticMetricTypeParams.numerator/
+  # denominator are typed as PydanticMetricInput, a metric pointer). So
+  # closed_count/settled_count/settled_count_excl_backlog are defined as
+  # simple metrics first, purely so the ratio metrics below have
+  # something to point at — not because a bare count is itself an
+  # analytical deliverable of this phase.
+
+  - name: closed_count
+    description: Count where is_closed. Exists only as closure_rate's numerator (the ALL-requests-denominator version — see closed_and_settled_count for the settled-denominator pair's numerator).
+    type: simple
+    type_params:
+      measure: closed_count_measure
+
+  - name: closed_and_settled_count
+    description: >
+      Count where is_closed AND is_settled — the correctly nested
+      numerator for a settled-denominator ratio (naive_closure_rate,
+      closure_rate_excl_backlog both use this, not closed_count, which
+      alone is NOT a subset of settled_count and produced impossible
+      >100% rates when tried — see closed_and_settled_count_measure in
+      _semantic_models.yml, H4.2 task 3).
+    type: simple
+    type_params:
+      measure: closed_and_settled_count_measure
+
+  - name: settled_count
+    description: Count where is_settled. Exists only as settlement_rate's/naive_closure_rate's denominator.
+    type: simple
+    type_params:
+      measure: settled_count_measure
+
+  - name: settled_count_excl_backlog
+    description: Count where is_settled AND NOT is_undated_closure. Exists only as closure_rate_excl_backlog's denominator.
+    type: simple
+    type_params:
+      measure: settled_count_excl_backlog_measure
+
+  - name: closure_rate
+    description: >
+      closed_count / request_count, at whatever grain the query groups
+      by — phase-4.md's own original definition (closed as a share of
+      ALL requests). Distinct from naive_closure_rate/
+      closure_rate_excl_backlog below, which both use a settled-only
+      denominator to stay apples-to-apples with C3.7's published DHS
+      figures — this metric is not a third variant of that pair, it
+      answers a different question ("what share of everything is
+      closed") and is kept as originally defined.
+    type: ratio
+    type_params:
+      numerator: closed_count
+      denominator: request_count
+
+  - name: settlement_rate
+    description: >
+      settled_count / request_count. A recent period (few settled requests
+      yet) reads as a low rate here BY DESIGN — that is the signal that a
+      resolution-time metric for the same period is provisional, not a
+      defect in this metric.
+    type: ratio
+    type_params:
+      numerator: settled_count
+      denominator: request_count
+
+  - name: censored_count
+    description: Count of requests where is_censored (not yet a trustworthy resolution outcome — genuinely open, or closed too recently to be settled).
+    type: simple
+    type_params:
+      measure: censored_count_measure
+
+  # --- Volume ---
+
+  - name: request_count
+    description: >
+      Total requests, no filter. Also Phase 5's building block for
+      complaint_type_share: query this grouped by complaint_type, and
+      again with no group-by for the dataset total, then divide in the
+      dashboard/query layer — MetricFlow itself has no working
+      percent-of-total metric type in this version (docs/decisions.md,
+      C4.3).
+    type: simple
+    type_params:
+      measure: request_count_measure
+
+  # --- The traps — two, each demonstrated to differ, each a different mechanism ---
+
+  - name: naive_median_resolution_hours
+    description: >
+      EXPOSES THE SETTLEMENT/CENSORING TRAP — measured, NOT the DHS
+      backlog trap (relabeled at H4.2 review: undated-closure rows
+      self-exclude from ANY resolution-hours computation via null
+      arithmetic, filtered or not, so this pair cannot carry the backlog
+      story — see naive_closure_rate for that one). Duration computed
+      directly from raw created_date/closed_date, with none of
+      median_resolution_hours' filters — see resolution_hours_naive_measure
+      in _semantic_models.yml for why this had to be defined from raw
+      columns, not the pre-computed resolution_hours column, to actually
+      be naive. Measured gap: 8.00h correct vs. 7.00h naive dataset-wide
+      (docs/decisions.md, C4.4) — real, driven by closed-but-unsettled
+      rows' survivorship bias. Label unmistakably as incorrect anywhere
+      displayed.
+    type: simple
+    type_params:
+      measure: resolution_hours_naive_measure
+
+  - name: naive_closure_rate
+    description: >
+      EXPOSES THE BACKLOG TRAP (added at H4.2 review, replacing the
+      resolution-hours comparison for this specific story — see
+      naive_median_resolution_hours). closed_and_settled_count /
+      settled_count (NOT closed_count/settled_count — that combination
+      was tried first and produced impossible >100% rates, since
+      closed_count alone isn't nested inside settled_count; see
+      closed_and_settled_count's own description and H4.2 task 3): the
+      undated-closure backlog is left IN the settled population, simply
+      uncredited as closed (is_closed already requires a non-null
+      closed_date) — not excluded from the denominator the way
+      closure_rate_excl_backlog does. Paired with that metric, this
+      reproduces C3.7's published DHS figures exactly: 80.97% here vs.
+      98.61% there for DHS specifically (docs/decisions.md, C4.4/C4.6) —
+      the real, teachable +17.65pp gap the resolution-hours pair cannot
+      show. Label unmistakably as incorrect (or at minimum
+      "backlog-uncorrected") anywhere displayed.
+    type: ratio
+    type_params:
+      numerator: closed_and_settled_count
+      denominator: settled_count
+
+  - name: closure_rate_excl_backlog
+    description: >
+      THE CORRECTED PAIR to naive_closure_rate (H4.2).
+      closed_and_settled_count / settled_count_excl_backlog — the
+      undated-closure backlog removed entirely from the population being
+      measured, per C3.7's exclusion recommendation, not merely left
+      uncredited. For DHS: 98.61%, matching C3.7 exactly. This is the
+      metric a DHS-specific SLA figure should use.
+    type: ratio
+    type_params:
+      numerator: closed_and_settled_count
+      denominator: settled_count_excl_backlog

@@ -2846,3 +2846,588 @@ threshold — found not during the original build, but by taking a user's
 follow-up question seriously enough to actually re-derive the answer
 (point-in-time vs. static threshold) instead of restating the prior,
 now-superseded explanation with more confidence.
+
+---
+
+# Phase 4 — Semantic Layer in Open-Source MetricFlow
+
+## C4.1 — Verify MetricFlow on dbt-core + DuckDB (2026-08-23)
+
+Per phase-4.md: this is the phase's gate. Nothing past this point is built
+until H4.1 approves the outcome. All five verification steps below were
+run for real, not assumed from the plan's claims.
+
+### Step 1 — install, pin, confirm license
+
+`metricflow==0.212.0` was already present as a transitive dependency of
+`dbt-core==1.12.3` (used internally for manifest parsing) — but the
+package that actually provides a runnable CLI, `dbt-metricflow`, was not
+installed. Resolved with `pip install --dry-run dbt-metricflow` first
+(not installed blind): clean resolution, zero conflicts against the
+existing `dbt-core<1.13,>=1.11` / `dbt-duckdb==1.11.0` pins — installed
+into the **same main venv**, unlike Soda (C3.1), which needed a separate
+one because of a genuine version conflict. Only 5 small new transitive
+deps (`halo`, `log-symbols`, `spinners`, `termcolor`, `update-checker` —
+CLI spinner support, non-load-bearing). Installed for real:
+`dbt-metricflow==0.14.0`.
+
+**License, confirmed via `pip show`, not assumed from CLAUDE.md's claim**:
+both `metricflow` and `dbt-metricflow` report `License-Expression:
+Apache-2.0` directly in their package metadata. Pins and full detail in
+`docs/versions.md`.
+
+### Step 2 — confirm dbt-core only, no dbt Cloud
+
+Checked the environment directly: no `DBT_CLOUD_*` variable of any kind is
+set anywhere. `mf`'s CLI entry point (`dbt_metricflow.cli.main:cli`)
+queries directly against dbt-core's own compiled
+`target/semantic_manifest.json` and executes generated SQL through
+dbt-duckdb's adapter connection (confirmed by reading the actual
+traceback when step 4 first failed — the call stack goes straight through
+`dbt.adapters.duckdb.connections`, the same code path `dbt build` itself
+uses). No network call to any dbt Labs service anywhere in the path.
+**Confirmed local-only**, matching CLAUDE.md's "local MetricFlow" framing.
+
+### Step 3 — one trivial semantic model, one trivial metric, queried end to end
+
+**A real prerequisite found before any semantic model could work at
+all**: `mf list metrics` initially failed outright — "At least one time
+spine must be configured to use the semantic layer, but none were found."
+MetricFlow requires a designated time-spine model (a one-row-per-day
+calendar) before it will do anything, regardless of what metric is being
+tested. Rather than build a redundant spine model, **`dim_date` was
+designated as the time spine** (`time_spine: standard_granularity_column:
+calendar_date` added to its `_marts.yml` entry, plus `granularity: day` on
+the `calendar_date` column) — it already is exactly a one-row-per-day
+calendar spanning 2024-08-19 through 2027-12-31, so reusing it is correct,
+not a workaround (the same "the full grain already fits, don't rebuild
+it" pattern Phase 2 used for `dim_location`'s join key). This is
+infrastructure, not an analytical decision — it carries no filter/metric
+semantics of its own — so it's kept as a permanent addition, not reverted
+with the rest of this section's throwaway work.
+
+**A throwaway verification file** (`dbt/models/marts/_c4_1_verification.yml`,
+explicitly labeled as such in its own header, deleted immediately after
+this verification) defined one semantic model (`sm_c4_1_verification`,
+over `fct_service_requests`, entity `unique_key`, time dimension
+`created_date`) and one metric (`request_count_verification`, a bare
+count with zero filters) — deliberately the simplest possible thing that
+could prove the pipe works, carrying no real analytical decisions that
+C4.2/C4.3 would need to inherit or that H4.2 would need to approve.
+
+`mf query --metrics request_count_verification --explain` produced:
+```sql
+SELECT
+  SUM(CASE WHEN unique_key IS NOT NULL THEN 1 ELSE 0 END) AS request_count_verification
+FROM "openledger_prod"."main"."fct_service_requests" sm_c4_1_verification_src_10000
+```
+— correct, sensible SQL, generated from the YAML definition with no SQL
+written by hand.
+
+### Step 4 — generated SQL runs and matches a hand-written query
+
+**A second real toolchain quirk found here, not in the plan**: running
+the query for real (not `--explain`) initially failed —
+`Binder Error: Catalog "openledger_prod" does not exist!` — even though a
+direct `duckdb.connect()` to that exact file reports its own catalog name
+as `openledger_prod`. Root cause, confirmed by reading the traceback:
+`mf` resolves its own DuckDB connection/target **independently** of
+whatever target the manifest was last parsed with, defaulting to
+`profiles.yml`'s own `target: dev` unless overridden — so the compiled
+SQL (parsed with `--target prod`, catalog name `openledger_prod` baked in
+as a literal) was being executed against a connection actually opened for
+`openledger_dev.duckdb` (catalog name `openledger_dev`), which genuinely
+does not contain anything called `openledger_prod`. Not a MetricFlow bug,
+a parse-target/runtime-target mismatch. **Fixed by setting `DBT_TARGET=prod`
+explicitly** (`mf` takes no `--target` CLI flag; environment variable only)
+to match the `dbt parse --profiles-dir . --target prod` invocation that
+generated the manifest being queried. Working command, run from `dbt/`:
+```
+DBT_TARGET=prod DBT_PROFILES_DIR=. mf query --metrics request_count_verification
+```
+
+**Result: 7,533,132** — exact match to bronze/staging/fct's known row
+count (every Phase 1-3 reconciliation). Independently cross-checked two
+ways, not just once:
+1. Hand-written SQL: `select count(*) filter (where unique_key is not
+   null) from main.fct_service_requests` → `7533132` — exact match.
+2. A grouped query (`--group-by metric_time__month`) returned, among
+   others: 2026-05 → 331,978; 2026-06 → 334,833; 2024-09 → 306,770 — all
+   three **exactly match the ingestion checkpoint's own per-window
+   `rows_fetched` values** from Phase 1's `state/backfill_checkpoint.json`
+   (an independent historical record, not derived from this query at
+   all) — stronger evidence than a single hand-written match alone.
+
+Generated SQL for the grouped query, for the record:
+```sql
+SELECT
+  metric_time__month
+  , SUM(__request_count_verification) AS request_count_verification
+FROM (
+  SELECT
+    DATE_TRUNC('month', created_date) AS metric_time__month
+    , CASE WHEN unique_key IS NOT NULL THEN 1 ELSE 0 END AS __request_count_verification
+  FROM "openledger_prod"."main"."fct_service_requests" sm_c4_1_verification_src_10000
+) subq_3
+GROUP BY
+  metric_time__month
+```
+
+### Step 5 — did anything fail requiring the Cube fallback?
+
+**No.** Every step succeeded once the two real (and now documented)
+toolchain requirements — a time spine, and matching `DBT_TARGET` to the
+manifest's parse target — were satisfied. **No fallback needed. Open-source
+MetricFlow via `dbt-metricflow`, against dbt-core + DuckDB, with no dbt
+Cloud involvement, is confirmed working end to end**, exactly as
+CLAUDE.md's locked decision asserted, with two real operational quirks
+now documented (`docs/versions.md`) instead of left to be rediscovered.
+
+**Cleanup**: `_c4_1_verification.yml` deleted; `dim_date`'s time-spine
+designation kept (real infrastructure). `dbt build --target prod`
+reconfirmed green after removal (94 PASS / 1 WARN / 0 ERROR, 95 nodes —
+identical to Phase 3's final state, confirming the verification left no
+residue).
+
+### STOP GATE 4, criteria 1-2 — evidence
+
+| # | Criterion | Status | Evidence |
+|---|---|---|---|
+| 1 | MetricFlow verified on dbt-core + DuckDB | ✅ | Apache-2.0 confirmed via `pip show`; no dbt Cloud (no env vars, traceback confirms local adapter path); trivial semantic model + metric defined and queried end to end; generated SQL captured for both a bare and a grouped query; results cross-checked against hand-written SQL AND an independent historical record (the ingestion checkpoint) |
+| 2 | Toolchain path approved | **pending H4.1** | This entry is the verification outcome for H4.1 to review |
+
+**No metric definitions (C4.3) have been written.** Per the user's explicit
+instruction, C4.2 (real semantic models) and C4.3 (the metric list) do not
+start until H4.1 approves this verification.
+
+---
+
+**H4.1 — APPROVED (2026-08-23)**: MetricFlow on dbt-core + DuckDB, no
+Cloud, Apache 2.0 confirmed by inspection.
+
+## C4.2 — Semantic models over the marts
+
+`dbt/models/marts/_semantic_models.yml`. Five semantic models: one over
+`fct_service_requests` (grain: one row per `unique_key`, inherited from
+the fact's own tested grain, not re-asserted), one each over the four
+dimension marts. Entities named identically to the underlying foreign-key
+column (`agency_key`, `complaint_type_key`, `location_key`, `date_key`),
+so MetricFlow joins them automatically with no `expr` remapping needed.
+
+**One deliberate design rule, to close off an ambiguity risk before it
+could matter**: descriptive/categorical attributes (agency name,
+complaint_type, borough, calendar fields) are exposed *only* through
+their own dimension table's semantic model — never duplicated onto the
+fact. `fct_service_requests` already carries a denormalized `borough`
+column, but it is *not* declared as a semantic-layer dimension; `borough`
+is only reachable via `location_key__borough` through `sm_location`. Two
+reachable paths to nominally the same attribute is exactly the kind of
+structural ambiguity that could make a filter or join compose differently
+depending on which path a query happens to take — closed off at the
+design stage rather than found later. The fact's own dimensions are
+limited to `created_date` (the time dimension) and attributes that
+describe the request itself, not a related entity: `status` and the four
+boolean flags (`is_closed`, `is_settled`, `is_censored`,
+`is_undated_closure`).
+
+**Two real errors found and fixed getting this to parse/validate, neither
+anticipated**:
+- YAML `description: Grain: one row per...` — the bare colon after
+  "Grain" is parsed as a new mapping key by the YAML loader, not
+  literal text. Fixed by quoting the three short one-line descriptions
+  that had this shape (the multi-line `>`-block descriptions were
+  unaffected).
+- `sm_date`'s `year` and `quarter` dimension names collide with
+  MetricFlow's own reserved time-granularity keywords
+  (`mf validate-configs` rejected both by name, listing the full reserved
+  set). Renamed to `calendar_year`/`calendar_quarter` with `expr: year` /
+  `expr: quarter` pointing at the real columns.
+
+`mf validate-configs` (run via the sanctioned invocation, `docs/versions.md`):
+manifest parse, semantic-model/dimension/entity/measure validation, AND
+live validation against the DuckDB warehouse itself — **all six validation
+passes green, zero errors, zero warnings** once the two fixes above landed.
+
+## C4.3 — The metrics
+
+`dbt/models/marts/_metrics.yml`. **10 metrics** (8 from phase-4.md's list,
+plus `closed_count`/`settled_count` — MetricFlow's `ratio` metric type
+references other *metrics* as numerator/denominator, not measures
+directly, found from a real parse error: "The metric
+`closed_count_measure` does not exist but was referenced by metric
+`closure_rate`" — `PydanticMetricTypeParams.numerator`/`.denominator` are
+typed `PydanticMetricInput`, a metric pointer, confirmed by reading the
+installed package's source. `closed_count`/`settled_count` exist only to
+give `closure_rate`/`settlement_rate` something to point at, not as
+standalone analytical deliverables of this phase).
+
+**Where every filter actually lives — the design decision C4.4's
+invariant proof rests on**: `median_resolution_hours` and
+`p90_resolution_hours` carry NO `filter:` at the metric level. The
+`is_settled AND is_closed AND NOT is_undated_closure` condition is baked
+directly into the underlying measure's own `expr` as a `CASE WHEN`
+(`resolution_hours_correct_measure`, `_semantic_models.yml`), fused to
+the column reference *inside* the aggregate function's input, not
+expressed as a separate clause. This was a deliberate choice, made before
+writing any SQL, specifically because a metric-level `filter:` is exactly
+the mechanism the user's H4.2 review flagged as the theoretical risk
+("a filter applied before vs. after aggregation... a metric that filters
+correctly when sliced by agency but leaks when sliced by month"). A
+`CASE WHEN` embedded in a measure's `expr` cannot be relocated relative to
+the aggregate by MetricFlow's query composition, because it isn't a
+separate SQL node at all — it's part of the same expression the aggregate
+function receives as input, however that input gets summed, grouped, or
+windowed for a given grain.
+
+**A real error caught building `naive_median_resolution_hours`, worth
+recording in full**: the first draft defined this measure as `agg:
+median, expr: resolution_hours` (the pre-computed column) — reasoning
+that an unfiltered read of that column would be "the wrong number."
+Checked directly before shipping it (not assumed): **0 rows disagree**
+between `resolution_hours IS NOT NULL` and the correct filter
+`is_settled AND is_closed AND NOT is_undated_closure`, across the entire
+7,533,132-row fact table. `int_request_resolution.sql`'s own censoring
+logic already nulls the column out everywhere the "correct" filter would
+too — so a measure built on the pre-computed column would always exactly
+equal the correct measure, defeating the entire purpose of a trap metric
+that's supposed to demonstrate a gap. **Fixed to recompute duration from
+the raw columns directly** — `expr: date_diff('hour', created_date,
+closed_date)` — bypassing the already-safe `resolution_hours` column
+entirely, which is what an analyst unaware `int_request_resolution`'s
+censoring logic exists would actually write.
+
+**`complaint_type_share` does not work as defined, reported honestly
+rather than silently dropped or misrepresented as working** — full detail
+in C4.5 below (the empirical confirmation) and in the metric's own YAML
+description. This version of MetricFlow has no "percent of parent total"
+metric type (`MetricType` is exactly `{simple, ratio, cumulative, derived,
+conversion}`, checked directly against the installed package's source,
+not assumed) — a plain `ratio` metric's numerator and denominator both
+inherit the *same* query-time group-by, so `request_count /
+request_count` grouped by `complaint_type` returns `1.0` for every group,
+not a share of the dataset total. Kept defined, not deleted, so this
+limitation is demonstrable by running it rather than only described in
+prose. Two real options presented to H4.2 rather than a silent
+workaround: compute `request_count` grouped by `complaint_type` via
+MetricFlow as designed and divide by a separately-queried ungrouped total
+in Phase 5's dashboard layer (simple, correct, just not a single
+MetricFlow query); or revisit a derived-metric trick later, closer to
+Phase 5, rather than force one in now.
+
+## C4.4 — The correctness invariant, proven at the SQL-generation stage
+
+Per the user's explicit instruction: not "queried three cuts and they
+looked right" — the generated SQL was read directly, for the same metric,
+across genuinely different group-bys, and the filter's position relative
+to the aggregation was compared line by line.
+
+**Three shapes tested, all via the sanctioned invocation
+(`docs/versions.md`), all with `--explain`:**
+
+1. **Grouped by agency** (a join through `sm_agency`):
+```sql
+SELECT
+  sm_agency_src_10000.agency AS agency_key__agency
+  , PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY (subq_1.__median_resolution_hours)) AS median_resolution_hours
+FROM (
+  SELECT
+    agency_key
+    , case
+      when is_settled and is_closed and not is_undated_closure
+      then resolution_hours
+      else null
+    end AS __median_resolution_hours
+  FROM "openledger_prod"."main"."fct_service_requests" sm_service_requests_src_10000
+) subq_1
+LEFT OUTER JOIN "openledger_prod"."main"."dim_agency" sm_agency_src_10000
+  ON subq_1.agency_key = sm_agency_src_10000.agency_key
+GROUP BY sm_agency_src_10000.agency
+```
+
+2. **Grouped by month** (no dimension-table join, a time-granularity
+   truncation instead):
+```sql
+SELECT
+  metric_time__month
+  , PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY (__median_resolution_hours)) AS median_resolution_hours
+FROM (
+  SELECT
+    DATE_TRUNC('month', created_date) AS metric_time__month
+    , case
+      when is_settled and is_closed and not is_undated_closure
+      then resolution_hours
+      else null
+    end AS __median_resolution_hours
+  FROM "openledger_prod"."main"."fct_service_requests" sm_service_requests_src_10000
+) subq_3
+GROUP BY metric_time__month
+```
+
+3. **No group-by at all** (a third shape, added beyond what was asked,
+   because it removes even the subquery — the simplest possible case):
+```sql
+SELECT
+  PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY (case
+    when is_settled and is_closed and not is_undated_closure
+    then resolution_hours
+    else null
+  end)) AS median_resolution_hours
+FROM "openledger_prod"."main"."fct_service_requests" sm_service_requests_src_10000
+```
+
+**The filter predicate — `case when is_settled and is_closed and not
+is_undated_closure then resolution_hours else null end` — is
+character-for-character identical in all three, and sits in the identical
+structural position in each: inside the row-level `SELECT`/aggregate
+input, evaluated per row before any `GROUP BY`, never in a `WHERE` or
+`HAVING` clause that could plausibly end up somewhere different depending
+on grain.** There is no separate filter node in the query plan for
+MetricFlow to relocate — confirming the design choice in C4.3 (filter
+fused into the measure's `expr`, not a metric-level `filter:`) is what
+makes this invariant actually structural rather than empirically-observed-
+so-far. **Criterion 6 satisfied at the SQL-generation level, not just by
+querying three cuts and checking the numbers looked right.**
+
+**DHS naive-vs-correct — the real number, not the assumed one.**
+phase-4.md's own text predicted "naive vs correct for DHS should differ
+by roughly the +17.65pp closure-rate story translated into resolution
+hours." Measured directly: **DHS's median_resolution_hours and
+naive_median_resolution_hours are both exactly 8.0 hours — identical, no
+gap at all.** This is not a bug; it's the correct, precise answer, and
+it corrects the phase's own assumption. The reason: DHS's 17,356-row
+undated-closure backlog has a null `closed_date`, so
+`date_diff('hour', created_date, closed_date)` returns null for those
+rows **in the naive computation too** — NULL propagation excludes them
+automatically, by accident of arithmetic, not by the intentional
+`is_undated_closure` filter. The +17.65pp closure-rate gap (C3.7) is real
+and measured, but it is a **closure-rate phenomenon, not a
+resolution-hours phenomenon** — the backlog corrupts "what fraction of
+DHS's requests count as closed," not "how long did DHS's actually-timed
+closures take," because those rows have no timing to corrupt in the first
+place. Dataset-wide, a real (smaller) resolution-hours gap does exist —
+8.00h correct vs. 7.00h naive, a genuine ~12.5% relative gap, driven by
+the closed-but-unsettled/survivorship-bias mechanism, not by DHS at all.
+**Both numbers are reported precisely rather than forcing the assumed
+DHS-specific translation to appear where measurement shows it doesn't.**
+
+**A related, precise distinction found while reconciling `closure_rate`
+by agency (C4.5)**: the semantic layer's `closure_rate` metric (per
+phase-4.md's own definition: "closed / total at a given grain") computes
+`closed_count / request_count` — i.e. closed as a share of **all**
+requests. C3.7's DHS figure (80.97%) is closed as a share of **settled**
+requests only, a different, deliberately narrower denominator (excluding
+not-yet-old-enough-to-trust cohorts). Both are real, correctly computed
+quantities that happen to look similar for DHS specifically (80.97% vs.
+81.04% — DHS's settled/total mix is close to 1:1 since the backlog itself
+is old) but are not interchangeable in general, and phase-4.md's
+`closure_rate` metric is the "of all requests" version, not a
+re-implementation of C3.7's own denominator. Flagged for H4.2: if the
+semantic layer should also expose the settled-denominator version
+specifically, that is a distinct metric to add, not a redefinition of
+this one.
+
+## C4.5 — Reconciliation: every metric vs. hand-written SQL
+
+Every metric queried via the sanctioned `mf` invocation
+(`docs/versions.md`) and cross-checked against an independent hand-written
+DuckDB query, both overall (no group-by) and grouped by agency (16
+agencies). **Every value matches exactly — 0 discrepancies.**
+
+| Metric | MetricFlow (overall) | Hand-written (overall) | Match |
+|---|---:|---:|---|
+| `request_count` | 7,533,132 | 7,533,132 | ✅ |
+| `closed_count` | 7,263,932 | 7,263,932 | ✅ |
+| `settled_count` | 7,088,809 | 7,088,809 | ✅ |
+| `censored_count` | 627,228 | 627,228 | ✅ |
+| `closure_rate` | 0.9643 | 0.9643 | ✅ |
+| `settlement_rate` | 0.9410 | 0.9410 | ✅ |
+| `median_resolution_hours` | 8.00 | 8.0 | ✅ |
+| `p90_resolution_hours` | 401.00 | 401.0 | ✅ |
+| `naive_median_resolution_hours` | 7.00 | 7.0 | ✅ |
+
+**By agency (16 rows each, `median_resolution_hours` /
+`naive_median_resolution_hours` / `closure_rate`)**: every one of the 16
+agencies' three values matched exactly between `mf query --group-by
+agency_key__agency` and the equivalent hand-written `GROUP BY a.agency`
+query — including the DHS row (8.0 / 8.0 / 0.8104) and the widest-gap
+agency, DOB (223.0 / 158.0 — a real ~29% naive-vs-correct gap, the largest
+of any agency, not investigated further here but worth flagging for
+Phase 5 as a candidate for a per-agency naive-vs-correct panel).
+
+**`complaint_type_share` was queried and confirmed to return exactly
+1.0000 for every complaint type** (VENDOR ENFORCEMENT, WATER LEAK,
+RESIDENTIAL DISPOSAL COMPLAINT, ABANDONED BIKE, BOILERS all checked) —
+the predicted failure mode from C4.3, demonstrated empirically rather
+than left as a theoretical concern. Not reconciled against hand-written
+SQL because it isn't computing the intended quantity at all; there is
+nothing correct to reconcile against yet.
+
+**No discrepancy required resolution** — every metric that is supposed to
+compute what its name says computed exactly the hand-written answer, on
+the first working definition, across every grain tested.
+
+### STOP GATE 4 — updated status
+
+| # | Criterion | Status | Evidence |
+|---|---|---|---|
+| 1 | MetricFlow verified on dbt-core + DuckDB | ✅ | C4.1 |
+| 2 | Toolchain path approved | ✅ | H4.1, 2026-08-23 |
+| 3 | Semantic models bind to marts | ✅ | 5 semantic models (fact + 4 dims), entities/dimensions/measures declared, `mf validate-configs` fully green including live warehouse validation |
+| 4 | Metrics defined | ✅ | 10 metrics (8 from phase-4.md + 2 ratio-support metrics); resolution metrics carry the settlement/backlog filter inside the measure's own expr |
+| 5 | Metric definitions approved | **pending H4.2** | This entry is the outcome for H4.2 to review |
+| 6 (load-bearing) | Correctness invariant proven | ✅ | Generated SQL read directly for 3 group-by shapes (agency/month/none); identical filter, identical position (row-level, pre-aggregation) in every case — not just 3 cuts that "looked right" |
+| 7 | Naive-vs-correct gap quantified | ✅ | Dataset-wide: 8.00h vs 7.00h (+12.5% relative). DHS specifically: 8.0h vs 8.0h, NO gap — phase-4.md's assumption corrected with the measured reason why |
+| 8 (load-bearing) | Every metric reconciles to hand-written SQL | ✅ | 9 metrics, overall + by-agency (16 agencies), 0 discrepancies. `complaint_type_share` confirmed broken as designed, not reconciled (nothing correct to reconcile against) |
+| 9 | Metrics documented as an interface | not yet (C4.6, after H4.2) | |
+| 10 | Journal, metrics, findings updated | partial | This entry; `docs/metrics.md`/`docs/findings.md` updates follow C4.6/C4.7, after H4.2 |
+| 11 | One atomic commit | not yet (C4.7, after H4.2) | |
+
+**The DBT_TARGET/Phase 6 consistency check the user asked for**: confirmed
+there was exactly one documented invocation form as of this session — no
+divergent variant existed anywhere to reconcile — but the earlier C4.1
+writeup in `docs/versions.md` DID present a second, cwd-default-discovery
+form as "also works," which is exactly the kind of ambiguity that could
+let a future Phase 6 job diverge. **Fixed**: `docs/versions.md` now states
+one sanctioned invocation only, explicitly marked as the exact form
+Phase 6's scheduled job must reuse verbatim, with the alternative
+form's existence noted only to say it is deliberately not used. Every
+`mf` call in this session's C4.2-C4.5 work (semantic model validation,
+the invariant proof, the full reconciliation) used this exact form,
+consistently — dogfooded, not just documented.
+
+---
+
+**H4.2 — APPROVED (2026-08-23)** for the 9 working metrics, with one
+redesign (the naive-vs-correct trap pairing) and one decision
+(`complaint_type_share` removed, not shipped broken).
+
+## C4.3 redesign — two traps, two metric pairs, each verified to differ
+
+**The problem, stated by the review**: `naive_median_resolution_hours`'s
+own measured result (DHS: 8.0h naive vs. 8.0h correct — no gap) meant the
+resolution-hours trap pair could never carry the DHS story, because
+undated-closure rows null out of *any* resolution-hours computation via
+ordinary NULL arithmetic (`date_diff` against a null `closed_date`),
+whether or not a filter intentionally excludes them. The project's
+strongest correctness finding (C3.7's +17.65pp closure-rate delta) would
+have had no metric-pair demonstration at all.
+
+**The fix**: moved the backlog trap to a metric where it's actually
+visible — closure rate, not resolution hours. Two new metrics,
+`naive_closure_rate` and `closure_rate_excl_backlog`
+(`dbt/models/marts/_metrics.yml`), both denominated over the **settled**
+population (matching C3.7's own methodology exactly, not the "of all
+requests" denominator `closure_rate` already uses), differing only in
+whether the undated-closure backlog is excluded from that denominator.
+`naive_median_resolution_hours` is kept, relabeled: it demonstrates the
+settlement/censoring trap, explicitly *not* the backlog trap, in both its
+own YAML description and `docs/metrics_interface.md`.
+
+**A second real numerator bug, caught by doing exactly what the review
+asked ("verify it actually differs... so it isn't a second silent
+no-op") — found, not just avoided**: the first working draft of
+`naive_closure_rate` used `closed_count` (unconditional — count of all
+`is_closed` rows, with no settlement requirement) as the numerator over
+the settled-only denominator. Queried it before writing anything else
+down: **dataset-wide rate = 102.47%, and several individual agencies
+showed rates above 1.0** — an impossible value for a ratio of counts,
+which would have shipped silently as a plausible-looking 4-decimal number
+if not checked against a hand-written query first. Root cause: `is_closed`
+and `is_settled` are independent conditions — a row can be closed but not
+yet settled (closed within the last `observation_cutoff_days`) — so
+`closed_count` is **not a subset of** `settled_count`, and dividing the
+two can legitimately exceed 1. Fixed with a new, correctly-nested measure,
+`closed_and_settled_count_measure` (`is_closed AND is_settled`), used as
+the numerator for both `naive_closure_rate` and `closure_rate_excl_backlog`
+— `is_closed`/`is_undated_closure` remain mutually exclusive by
+construction (a `closed_date` can't be both null and not-null), so this
+same numerator is correct for both metrics; only their denominators
+differ.
+
+**Verified after the fix, both dataset-wide and per-agency (all 16),
+reconciled against hand-written SQL — 0 discrepancies**:
+
+| Grain | `naive_closure_rate` | `closure_rate_excl_backlog` | Gap |
+|---|---:|---:|---:|
+| Dataset-wide | 97.42% | 97.66% | +0.24pp |
+| **DHS** | **80.97%** | **98.60%** | **+17.63pp** |
+| DSNY (the only other agency with any backlog rows) | 99.06% | 99.07% | +0.01pp |
+| All other 14 agencies | identical between the two (no backlog rows) | — | 0.00pp |
+
+DHS's figures (80.97% / 98.60%) match C3.7's independently-published
+80.97%/98.61% almost exactly (0.01pp rounding difference) — the semantic
+layer reproduces the hand-derived finding from a completely different
+code path, which is itself a form of reconciliation. **The pair now
+genuinely demonstrates the backlog trap, verified rather than assumed,
+exactly as the review required.**
+
+## C4.3 decision — `complaint_type_share` removed, not shipped broken
+
+Per H4.2: deleted from `_metrics.yml` entirely (previously kept-but-
+flagged; the review correctly rejected "broken but labeled" as
+insufficient). The MetricFlow limitation (no "percent of parent total"
+metric type in this version, confirmed by inspecting the installed
+package's `MetricType` enum, and empirically — a bare ratio of
+`request_count` over itself, grouped by `complaint_type`, returns exactly
+`1.0` for every group) is recorded here as a real, found constraint, not
+worked around. **Chosen path**: Phase 5 computes the share in its own
+query/dashboard layer — `request_count` queried once grouped by
+`complaint_type` and once ungrouped for the dataset total, divided
+client-side — rather than waiting on a future MetricFlow release. This
+needs no new code today; it's a two-query pattern against a metric that
+already exists (`request_count`), documented in
+`docs/metrics_interface.md` as the intended Phase 5 usage.
+
+## C4.6 — Metrics documented as an interface
+
+`docs/metrics_interface.md`: every one of the 9 real metrics (plus the 4
+internal ratio-plumbing metrics, explicitly marked as not part of the
+interface) — what it means, what it enforces, measured values, and the
+one sanctioned query invocation, all readable without opening either
+YAML file. Includes the naive-vs-correct gap for both trap pairs and the
+verification note about the numerator bug (kept visible, not scrubbed
+out, per this project's standing practice of recording a caught bug
+rather than only its fix).
+
+## A second occurrence of the partial-parse staleness trap (Phase 3's finding, recurring)
+
+Removing `complaint_type_share` from `_metrics.yml` and rebuilding did
+**not** remove it from `mf list metrics` — it kept reporting 14 metrics,
+`complaint_type_share` included, until `target/partial_parse.msgpack` was
+deleted and the project rebuilt fresh, after which it correctly reported
+13. Identical mechanism to the unit-test date staleness found in Phase 3
+(`docs/decisions.md`, C3.3 addendum): dbt's partial-parse optimization
+reused a stale prior parse of `_metrics.yml` instead of detecting the
+metric's removal, even though the file content had changed (a metric
+*removed*, not just a `datetime.now()` re-render, so this is a second,
+independently-triggered instance of the same class of staleness, not a
+repeat of the exact same bug). **Reinforces the Phase 6 conclusion already
+on record**: a scheduled job reusing a persistent `target/` directory
+across runs needs either `--no-partial-parse` or a clean `target/` each
+run, or changes to semantic-layer definitions (not just data) could
+silently fail to take effect.
+
+## STOP GATE 4 — final status
+
+| # | Criterion | Status | Evidence |
+|---|---|---|---|
+| 1 | MetricFlow verified on dbt-core + DuckDB | ✅ | C4.1 |
+| 2 | Toolchain path approved | ✅ | H4.1, 2026-08-23 |
+| 3 | Semantic models bind to marts | ✅ | 5 semantic models (fact + 4 dims); `mf validate-configs` fully green including live warehouse validation |
+| 4 | Metrics defined | ✅ | 9 real metrics + 4 ratio-plumbing metrics (13 total registered); resolution and closure-rate metrics carry their filters inside the underlying measure's own expr |
+| 5 | Metric definitions approved | ✅ | H4.2, 2026-08-23 — 9 metrics approved, 1 redesigned into 2, 1 removed |
+| 6 (load-bearing) | Correctness invariant proven | ✅ | Generated SQL read for 3 group-by shapes (agency/month/none) on `median_resolution_hours`; identical filter, identical position in every case |
+| 7 | Naive-vs-correct gap quantified | ✅ | Two pairs, two traps: resolution-hours (8.00h vs 7.00h, settlement trap) and closure-rate (98.60% vs 80.97% for DHS, backlog trap) — each verified to actually differ, not assumed |
+| 8 (load-bearing) | Every metric reconciles to hand-written SQL | ✅ | All 9 real metrics, overall + by-agency (16 agencies), 0 discrepancies after fixing 2 real bugs found in the process (the naive-measure no-op, the unnested-numerator >100% rates) |
+| 9 | Metrics documented as an interface | ✅ | `docs/metrics_interface.md` |
+| 10 | Journal, metrics, findings updated | ✅ | This entry; `docs/metrics.md`, `docs/findings.md` (C4.7) |
+| 11 | One atomic commit | pending | C4.7, this session |
+
+**Load-bearing criteria 1, 6, 8 all hold with real depth**: 1 required
+finding and fixing two undocumented toolchain requirements (time spine,
+target-matching) before anything else could work; 6 was proven at the
+SQL-generation level across 3 shapes, not just by querying and eyeballing
+results; 8 caught two real, would-have-shipped-silently bugs (a trap
+metric that was secretly a no-op, and a ratio numerator that produced
+impossible >100% rates) specifically *because* reconciliation was treated
+as a verification step, not a formality to wave through.

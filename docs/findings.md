@@ -454,3 +454,48 @@ on requests it can compute a duration for). Any DHS-specific SLA figure
 that doesn't state which of these two readings it's using — including any
 number that eventually reaches the README or the Phase 5 dashboard — is
 not fully specified.
+
+## C4.4 — The DHS backlog distorts closure rate, NOT resolution hours — stated precisely, because the two are easy to conflate
+
+Phase 4's own plan assumed the DHS undated-closure backlog would show up
+as a gap between a naive and a correct `median_resolution_hours` — "naive
+vs correct for DHS should differ by roughly the +17.65pp closure-rate
+story translated into resolution hours." **Measured directly, this is
+false, and the reason is itself the finding**: DHS's naive and correct
+`median_resolution_hours` are both exactly **8.0 hours — no gap at all**.
+
+**Why**: the backlog's defining property is a null `closed_date`. A
+resolution-hours computation, naive or correct, always involves
+`date_diff('hour', created_date, closed_date)` somewhere — and DuckDB
+(like any SQL engine) returns `NULL` for that expression the instant
+`closed_date` is `NULL`, before any explicit filtering logic even runs.
+The backlog rows drop out of *any* resolution-hours aggregate
+automatically, as a side effect of ordinary null arithmetic, not because
+a correctness filter caught them. There is no "naive" way to compute a
+resolution-hours metric that accidentally includes these rows, because
+they were never going to have a duration value to include.
+
+**Closure rate has no equivalent escape hatch.** `is_closed` is a boolean
+derived from `status = 'Closed' AND closed_date IS NOT NULL` — the
+backlog rows genuinely can be counted or not counted depending entirely
+on how the denominator is constructed, because "is this row closed" and
+"does this row have a computable duration" are different questions with
+different null-handling behavior. That's exactly why C3.7's +17.65pp
+finding is real and measurable for closure rate (confirmed again here,
+independently, via the semantic layer: `naive_closure_rate` 80.97% vs.
+`closure_rate_excl_backlog` 98.60% for DHS, `docs/decisions.md` C4.3) and
+has no counterpart in resolution hours at all.
+
+**The general lesson, not just a DHS-specific one**: a data-quality
+condition defined by "a field is null" will silently, automatically
+exclude itself from any metric that requires that same field's value to
+compute an aggregate (durations, sums, averages over it) — but will NOT
+automatically exclude itself from a metric that only asks a yes/no
+question a different field can still answer (closure status, from
+`status`, independent of whether `closed_date` is populated). Whether a
+given backlog/censoring condition needs an *explicit* correctness filter
+or is already handled by ordinary null propagation depends on which kind
+of metric is being computed — this has to be checked per metric, not
+assumed to generalize from one case (exactly what building and verifying
+`naive_closure_rate` as a second, separate trap metric was for — see
+`docs/decisions.md`, C4.3, H4.2 redesign).
