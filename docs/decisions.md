@@ -3619,18 +3619,49 @@ a Vercel **deploy hook** (a webhook URL, created in the Vercel project's
 settings) fired by Phase 6's cron after step (2)'s commit, without
 needing a new git push per se — full wiring is Phase 6's job.
 
-**Proven once, locally, for real** (not merely described): steps (1) and
-the `evidence sources`/`evidence build` portion of what a rebuild does
-were run twice in this session for two different real reasons — the
-seasonality edge-month fix, and the date-formatting fix — both times
-producing a correctly updated `build/` output from a single script
-invocation plus the two `npm run` commands. **What could not be proven
-this session**: the actual Vercel redeploy trigger, since no Vercel
-project exists yet (H5.1 creates it). Once H5.1 is done, proving the full
-loop once (edit pruned source → rebuild → push → confirm the live site
-updates) is a single additional check, not new engineering.
+**Proven in full, this session, end to end** (2026-08-24, after H5.1
+fixed the Vercel project's Root Directory to `dashboard` and confirmed
+the live deploy): steps (1)-(3) run for real, not merely described.
+`python3 scripts/build_dashboard_source.py` re-read the (unchanged since
+Phase 4 — no new ingestion ran this session) prod warehouse and rewrote
+`openledger.duckdb`; the logical content was verified identical
+(`request_count`/`closure_rate_pct`/`median_resolution_hours` all
+matched the previous build exactly) while the **file bytes still
+differed** (`git diff --stat` showed a real change despite 0 rows
+changing) — a real, worth-recording observation: DuckDB's on-disk layout
+isn't byte-deterministic across writes even for identical logical
+content (likely internal metadata/ordering), so "no git diff" is never a
+valid signal that the underlying data didn't change, and conversely "a
+diff exists" doesn't by itself mean the data moved. This exact rebuild
+was committed and pushed to `main` in the same commit as the README URL
+addition — that push is what fired Vercel's git-integration redeploy
+(no separate deploy-hook call needed for a plain content refresh, since
+the project is already connected to this repo/branch). **Confirmed via
+an independent `WebFetch` of the live URL after the push**, not assumed
+from the push succeeding: the site re-rendered with the same reconciled
+figures (7,533,132 requests, 96.4% closure rate, 8h median — unchanged,
+as expected since the underlying data didn't move), all 5 navigation
+links present.
 
-## STOP GATE 5 — status (Claude Code side; H5.1/H5.2 are the user's)
+**The manual steps Phase 6 must automate, stated precisely**:
+1. `python3 scripts/build_dashboard_source.py` (from repo root, main venv
+   active) — rewrites `dashboard/sources/openledger/openledger.duckdb`
+   from whatever the prod warehouse currently contains. Depends on
+   `dbt/target/openledger_prod.duckdb` being current — this step must run
+   **after** that phase's `dbt build --target prod`, never before.
+2. `git add dashboard/sources/openledger/openledger.duckdb && git commit
+   -m "..." && git push origin main` — the push is the trigger; no
+   Vercel CLI or API call needed as long as the project's GitHub
+   integration stays connected to this branch.
+3. Verification (what a human or Phase 6's job did/should do): confirm
+   the new deployment shows the expected data, not just that the build
+   succeeded — a green Vercel build with silently-stale or broken data
+   underneath it is a worse failure mode than an obviously-failed build,
+   because nothing flags it. `WebFetch`-equivalent, or a lightweight
+   scripted check against the live URL's rendered totals, is the cheap
+   version of this for a cron job.
+
+## STOP GATE 5 — CLOSED (2026-08-24)
 
 | # | Criterion | Status | Evidence |
 |---|---|---|---|
@@ -3640,9 +3671,15 @@ updates) is a single additional check, not new engineering.
 | 4 | Naive-vs-correct shown | ✅ | DHS backlog pair (Agency Performance), settlement pair (Data Quality) |
 | 5 | Provisional metrics annotated | ✅ | Missing-coordinate note, seasonality partial-month exclusion + alert, settled-only filters inherited from Phase 4 |
 | 6 (load-bearing) | Headline numbers reconcile | ✅ | C5.6 table, 0 discrepancies, caught one real finding (seasonality edge months) in the process |
-| 7 (load-bearing) | Deployed and public | **pending H5.1** | Deploy config prepared and locally proven; needs the user's Vercel account |
-| 8 | All pages render live | pending H5.1 | Cannot confirm live rendering without a live deployment |
-| 9 | Ninety-second test passed | pending H5.2 | The user's subjective judgment |
-| 10 | Refresh path documented and proven once | partial | Local rebuild half proven twice; the Vercel-redeploy half needs H5.1's project to exist first |
-| 11 | Journal, metrics updated; URL in README stub | partial | This entry + `docs/metrics.md`; README stub written with a placeholder pending the live URL |
-| 12 | One atomic commit | not yet | After H5.1/H5.2, per C5.9 |
+| 7 (load-bearing) | Deployed and public | ✅ | https://openledger-three.vercel.app — H5.1 done (Root Directory fixed after the initial 404), confirmed loading anonymously |
+| 8 | All pages render live | ✅ | H5.2: all five pages confirmed by the user; independently re-verified via `WebFetch` post-refresh (this entry) |
+| 9 | Ninety-second test passed | ✅ | H5.2 passed |
+| 10 | Refresh path documented and proven once | ✅ | Full loop run for real this session: rebuild → commit → push → live redeploy → confirmed via independent fetch |
+| 11 | Journal, metrics updated; URL in README stub | ✅ | This entry, `docs/metrics.md`; README now has the live URL |
+| 12 | One atomic commit | ✅ | C5.9 initial commit `d014afc`; this URL/refresh addition is a small follow-up, matching the two-commit pattern already used in Phase 3 |
+
+**Load-bearing criteria 1, 6, 7 all hold with real depth**: 1 and 6 from
+C5.1/C5.6's original reconciliation work; 7 survived a real failure
+first (the initial deploy 404'd because nothing had been pushed and the
+Root Directory wasn't set) and is now independently re-confirmed live,
+not just trusted from the user's report.

@@ -475,7 +475,12 @@ Phase 5. Verified reproducible from a clean `npm install` (no manual
 flags, relying on a committed `.npmrc`) — the same install path Vercel's
 build environment will use.
 
-**Pending H5.1/H5.2** (the user's account-level steps): live public URL,
-anonymous-load confirmation, all-pages-render-live check, the ninety-second
-test, and the full refresh-loop proof (local half already proven twice
-this session; the Vercel-redeploy half needs the project to exist first).
+**H5.1/H5.2 — closed.** Live public URL: **https://openledger-three.vercel.app**
+(the initial deploy 404'd — nothing had been pushed to `main` yet and the
+Vercel project's Root Directory wasn't set to `dashboard`; both fixed,
+redeployed, confirmed loading anonymously). H5.2 (the ninety-second test):
+passed, all five pages confirmed. Refresh path proven in full: pruned
+source rebuilt, committed, pushed — the push alone triggered Vercel's
+auto-redeploy (git integration, no manual deploy-hook call needed) — and
+the live site was independently re-fetched afterward to confirm it still
+rendered the same reconciled figures (7,533,132 / 96.4% / 8h).

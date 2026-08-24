@@ -6,7 +6,7 @@ Soda distributional checks, five operational anomaly detectors, a live scorecard
 MetricFlow semantic layer with correctness rules enforced at the query-generation
 level, and a public dashboard.
 
-**Live dashboard:** _pending deployment (Phase 5, H5.1)_
+**Live dashboard:** https://openledger-three.vercel.app
 
 Full README — architecture diagram, quickstart, metrics table, limitations — is
 Phase 7. This is a stub so the live URL has somewhere to land as soon as it exists.
