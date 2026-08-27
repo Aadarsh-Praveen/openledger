@@ -7,6 +7,16 @@ raw/*
 !raw/.gitkeep
 state/*
 !state/.gitkeep
+# C6.1: watermark/checkpoint/staleness + the S3 Iceberg catalog db are the
+# durable state a CI runner restores via git checkout — they must be tracked.
+!state/watermark.json
+!state/backfill_checkpoint.json
+!state/s3_catalog.db
+!state/staleness.json
+# C6.5: the DQ scorecard trend (the marts DuckDB isn't persisted across CI
+# runs, so history can't live there). The .csv.tmp sibling — only present
+# if a run crashed exactly at the atomic rename — stays ignored by state/*.
+!state/scorecard_history.csv
 *.duckdb
 *.duckdb.wal
 !dashboard/sources/openledger/openledger.duckdb

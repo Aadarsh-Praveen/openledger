@@ -1,0 +1,107 @@
+name: Ingest
+
+# C6.3 — daily watermarked incremental ingest into the S3-native bronze table.
+#
+# Cron time (04:00 UTC): the NYC 311 publish cycle clusters at 01:33-02:03 UTC
+# (C1.1b). The incremental query window's upper bound is anchored to the most
+# recent BATCH_BOUNDARY_ANCHOR_UTC_HOUR=3 (03:00 UTC) boundary
+# (ingest/pipeline.py: _anchor_boundary) — firing before 03:00 UTC would anchor
+# to YESTERDAY's 03:00 and clip today's just-published rows out of the window.
+# 04:00 UTC clears the publish cluster by ~2h and the 03:00 anchor by 1h, which
+# absorbs GitHub Actions' documented scheduling jitter on `schedule` triggers
+# without risking a fire before the anchor.
+#
+# Never runs a full backfill — that stays the documented manual operation
+# (scripts/run_backfill.py / the original Phase 1 backfill), run once, by hand.
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ingest
+  cancel-in-progress: false
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (restores state/ via C6.1's git-committed state)
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run incremental ingest against S3-native bronze
+        id: ingest
+        env:
+          SOCRATA_APP_TOKEN: ${{ secrets.SOCRATA_APP_TOKEN }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+        run: python scripts/run_ingest_ci.py
+
+      # Runs only if the step above succeeded (S3 write already durably
+      # committed, or a correct short-circuit) — an exception in the ingest
+      # step skips this step by default, so watermark/checkpoint/staleness in
+      # git are never advanced past an unconfirmed S3 write (C6.1 requirement
+      # 6, "advance the pointer only after S3 confirms", applied at the git
+      # layer — see docs/decisions.md, C6.1).
+      - name: Commit updated state
+        if: success()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state/watermark.json state/backfill_checkpoint.json state/staleness.json state/s3_catalog.db
+          if git diff --cached --quiet; then
+            echo "No state changes to commit."
+          else
+            git commit -m "Ingest: watermark/checkpoint/staleness update ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+            git push
+          fi
+
+      # Separate from the ingest step's own exit code (C6.2/C6.6): a tripped
+      # staleness alarm is not an infra failure — the run succeeded and its
+      # outcome is already committed above. This step exists purely to make
+      # the job go red, distinguishably, for that specific reason.
+      - name: Fail if staleness alarm tripped
+        if: steps.ingest.outputs.alarm == 'true'
+        run: |
+          echo "::error::STALENESS ALARM — ${{ steps.ingest.outputs.consecutive_no_advance }} consecutive runs without a watermark advance (${{ steps.ingest.outputs.consecutive_short_circuits }} of them no-op short-circuits). State was still committed by the previous step; this step exists only to turn the job red for this specific reason. See docs/decisions.md, C6.2/C6.6."
+          exit 1
+
+      # C6.6 — notification. No extra service: GitHub emails the repo owner on
+      # any failed workflow run natively (account setting: Actions → "failed
+      # workflows only"). This step just makes the FIRST thing visible from
+      # that email — the run summary — say which of the two failure classes
+      # this was, so a staleness alarm is never mistaken for flaky infra.
+      - name: Explain the failure in the run summary
+        if: ${{ failure() }}
+        run: |
+          if [ "${{ steps.ingest.outputs.alarm }}" = "true" ]; then
+            {
+              echo "## 🟠 Ingest failed: STALENESS ALARM (not an infra failure)"
+              echo ""
+              echo "- consecutive runs with no watermark advance: **${{ steps.ingest.outputs.consecutive_no_advance }}** (threshold 2)"
+              echo "- of those, no-op short-circuits: **${{ steps.ingest.outputs.consecutive_short_circuits }}**"
+              echo "- the ingest itself succeeded and its state WAS committed"
+              echo "- action: check whether NYC 311 has genuinely stopped publishing, or the watermark is stuck — see docs/decisions.md, C6.2/C6.6"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "## 🔴 Ingest failed: infrastructure / pipeline error"
+              echo ""
+              echo "The ingest step itself errored (Socrata fetch, S3 write, or credentials)."
+              echo "State was NOT advanced. Re-running is safe — the S3 Iceberg commit and the"
+              echo "git watermark both only move on a fully successful run (C6.1 requirement 6)."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi

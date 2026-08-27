@@ -4,11 +4,20 @@ C1.5 — Iceberg bronze table: format version 2, partitioned by day(created_date
 partitions), written via upsert() on unique_key.
 """
 
+import os
+
 from pyiceberg.catalog.sql import SqlCatalog
 from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.transforms import DayTransform
 
-from ingest.config import BRONZE_NAMESPACE, BRONZE_TABLE_ID, CATALOG_DIR, WAREHOUSE_DIR
+from ingest.config import (
+    BRONZE_NAMESPACE,
+    BRONZE_TABLE_ID,
+    CATALOG_DIR,
+    S3_CATALOG_DB,
+    S3_WAREHOUSE_ROOT,
+    WAREHOUSE_DIR,
+)
 from ingest.schema import iceberg_schema
 
 CATALOG_DIR.mkdir(exist_ok=True)
@@ -16,6 +25,26 @@ WAREHOUSE_DIR.mkdir(exist_ok=True)
 
 
 def get_catalog():
+    """Local file-backed catalog by default (dev/backfill). C6.1: the scheduled
+    CI ingest workflow sets OPENLEDGER_USE_S3=1 explicitly to switch to the
+    S3-native bronze table instead — an explicit opt-in, not "AWS creds happen
+    to be present in the shell", so a local run can never accidentally write to
+    production S3 (the same silent-divergence risk already guarded against for
+    DBT_TARGET — see docs/versions.md)."""
+    if os.environ.get("OPENLEDGER_USE_S3") == "1":
+        missing = [v for v in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_DEFAULT_REGION") if not os.environ.get(v)]
+        if missing:
+            raise RuntimeError(f"OPENLEDGER_USE_S3=1 but missing env var(s): {', '.join(missing)}")
+        return SqlCatalog(
+            "openledger",
+            uri=f"sqlite:///{S3_CATALOG_DB}",
+            warehouse=S3_WAREHOUSE_ROOT,
+            **{
+                "s3.access-key-id": os.environ["AWS_ACCESS_KEY_ID"],
+                "s3.secret-access-key": os.environ["AWS_SECRET_ACCESS_KEY"],
+                "s3.region": os.environ["AWS_DEFAULT_REGION"],
+            },
+        )
     return SqlCatalog(
         "openledger",
         **{"uri": f"sqlite:///{CATALOG_DIR}/catalog.db", "warehouse": f"file://{WAREHOUSE_DIR}"},

@@ -4,7 +4,19 @@ title: Data Quality
 
 ```sql scorecard
 select * from openledger.dq_scorecard
+where run_date = (select max(run_date) from openledger.dq_scorecard)
 order by category, check_name, grain
+```
+
+```sql scorecard_trend
+select
+    run_date,
+    count(*) as checks_run,
+    count(*) filter (where status in ('fail', 'warn')) as checks_not_passing,
+    round(100.0 * count(*) filter (where status in ('pass', 'acknowledged', 'info')) / count(*), 1) as pass_rate_pct
+from openledger.dq_scorecard
+group by run_date
+order by run_date
 ```
 
 ```sql settlement_completeness
@@ -103,13 +115,37 @@ characterized and screened out first.
     <Column id=total_rows title="Rows touched" fmt="#,##0"/>
 </DataTable>
 
+## Scorecard over time
+
+Every scheduled pipeline run appends its full scorecard snapshot to a
+git-tracked history file (`state/scorecard_history.csv`), so this is a real trend,
+not a single reading. The line that matters is **checks not passing** — it should
+sit at zero, with the acknowledged DHS condition excluded by design.
+
+<LineChart
+    data={scorecard_trend}
+    x=run_date
+    y=checks_not_passing
+    yMax=5
+    title="Checks not passing, by run date"
+/>
+
+<LineChart
+    data={scorecard_trend}
+    x=run_date
+    y=pass_rate_pct
+    yMin=90
+    yMax=100
+    title="Pass rate %, by run date"
+/>
+
 ## The full scorecard
 
-Every contract, unit test, distributional check, and anomaly detector this project
-runs, in one table — including the checks that report zero, on purpose (a flat line at
-zero next to metrics that move is itself informative). DHS's persistent
-undated-closure condition shows as **acknowledged**, not failed: a known, dated,
-bounded condition, not something silently red forever.
+The most recent run's snapshot: every contract, unit test, distributional check, and
+anomaly detector this project runs, in one table — including the checks that report
+zero, on purpose (a flat line at zero next to metrics that move is itself
+informative). DHS's persistent undated-closure condition shows as **acknowledged**,
+not failed: a known, dated, bounded condition, not something silently red forever.
 
 <DataTable data={scorecard} rows=25 search=true>
     <Column id=category title="Category"/>

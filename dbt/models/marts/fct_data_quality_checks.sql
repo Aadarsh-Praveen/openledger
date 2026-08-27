@@ -1,10 +1,19 @@
 {#
   C3.6 — the DQ scorecard mart. Grain: one row per (check_name, grain,
-  run_date). Incremental (not a plain table) specifically so history
-  accumulates across runs — "the dashboard can show trend, not just
-  current state" per phase-3.md. Re-running on the same day replaces that
-  day's rows (delete+insert on the unique key); running on a new day adds
-  a new set alongside every prior day's, building the trend.
+  run_date). Emits ONLY the current run's snapshot.
+
+  C6.5 (was incremental until Phase 6): this was `materialized='incremental'`
+  so history would accumulate in the warehouse. But dbt/target/
+  openledger_prod.duckdb is not persisted between CI runs (fresh ephemeral
+  runner each time, ~600MB, not in git), so every scheduled build started
+  from an empty target and the incremental logic degraded to "insert
+  everything as new" — silently discarding every prior day. History now
+  lives in state/scorecard_history.csv (git-tracked, restored on checkout),
+  appended by scripts/append_scorecard_history.py after each build and read
+  by the dashboard for the trend. This model is the single-snapshot input
+  to that append. Keeping it incremental here would be hidden state of
+  exactly the kind (partial_parse.msgpack, is_settled) this project has
+  been bitten by before. See docs/decisions.md, C6.4/C6.5.
 
   Four categories, per phase-3.md:
     - contract: build-gated. If a contract were violated, `dbt build`
@@ -36,9 +45,7 @@
 
 {{
   config(
-    materialized='incremental',
-    unique_key=['check_name', 'grain', 'run_date'],
-    incremental_strategy='delete+insert'
+    materialized='table'
   )
 }}
 

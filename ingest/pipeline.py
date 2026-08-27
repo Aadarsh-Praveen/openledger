@@ -30,11 +30,37 @@ from ingest.config import (
     BACKFILL_START,
     BATCH_BOUNDARY_ANCHOR_UTC_HOUR,
     ORDER_TIEBREAKER,
+    STALENESS_ALARM_THRESHOLD,
     WATERMARK_BUFFER_HOURS,
     WATERMARK_FIELD,
 )
 
 log = logging.getLogger("ingest.pipeline")
+
+
+def _staleness_alarm_message(staleness):
+    """C6.2/C6.6: one alarm, self-explaining. consecutive_short_circuits is a
+    strict subset of consecutive_no_advance, so its value tells a human which
+    failure mode they're looking at without a second threshold."""
+    no_adv = staleness["consecutive_no_advance"]
+    sc = staleness.get("consecutive_short_circuits", 0)
+    if sc >= no_adv and sc > 0:
+        mode = (
+            f"all {sc} were no-op short-circuits — the query window has not changed "
+            f"between runs (frozen watermark/boundary, or the source has genuinely "
+            f"stopped publishing)"
+        )
+    elif sc == 0:
+        mode = (
+            "queries ran and returned rows on each, but none newer than the stored "
+            "watermark (source republishing stale data, or a watermark-compare bug)"
+        )
+    else:
+        mode = f"{sc} of them were short-circuits, the rest real fetches with nothing newer"
+    return (
+        f"STALENESS ALARM: watermark has not advanced in {no_adv} consecutive runs "
+        f"(threshold={STALENESS_ALARM_THRESHOLD}); {mode}. See C6.2 in docs/decisions.md."
+    )
 
 
 def month_windows(start_iso, end_exclusive):
@@ -221,9 +247,12 @@ def run_incremental():
         log.warning(f"SHORT-CIRCUIT: skipping incremental run. {reason}")
         skip_label = f"incremental_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}"
         checkpoint.mark_window_skipped(skip_label, window_start_iso, window_end_iso, reason)
+        staleness = checkpoint.record_run_outcome(advanced=False, short_circuited=True)
+        if staleness["consecutive_no_advance"] >= STALENESS_ALARM_THRESHOLD:
+            log.error(_staleness_alarm_message(staleness))
         return {
             "rows_fetched": 0, "rows_updated": 0, "rows_inserted": 0, "rows_no_op": 0,
-            "max_watermark_seen": None, "skipped": True,
+            "max_watermark_seen": None, "skipped": True, "staleness": staleness,
         }
 
     expected_count = socrata_client.count(where_clause)
@@ -246,8 +275,14 @@ def run_incremental():
         count_matched,
     )
 
-    if max_watermark_seen is not None and max_watermark_seen.replace(tzinfo=None) > watermark_dt.replace(tzinfo=None):
+    advanced = max_watermark_seen is not None and max_watermark_seen.replace(tzinfo=None) > watermark_dt.replace(tzinfo=None)
+    if advanced:
         checkpoint.save_watermark(max_watermark_seen.isoformat())
+
+    staleness = checkpoint.record_run_outcome(advanced=advanced, short_circuited=False)
+    if staleness["consecutive_no_advance"] >= STALENESS_ALARM_THRESHOLD:
+        log.error(_staleness_alarm_message(staleness))
+    result["staleness"] = staleness
 
     log.info(
         f"Incremental run {label}: fetched={result['rows_fetched']} "

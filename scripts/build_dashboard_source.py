@@ -187,7 +187,21 @@ def main() -> None:
     # directly (already pre-aggregated, already the audited source of
     # truth from Phase 3) rather than re-deriving anything.
     # ---------------------------------------------------------------
-    pull("dq_scorecard", "select * from main.fct_data_quality_checks")
+    # C6.5: fct_data_quality_checks is now a single-snapshot table (the
+    # marts DuckDB isn't persisted across CI runs, so it can't hold
+    # history). The scorecard trend lives in state/scorecard_history.csv,
+    # git-tracked and appended once per build. Read the full history from
+    # there when it exists; fall back to the single current snapshot for a
+    # fresh local checkout that hasn't run the append script yet.
+    scorecard_csv = ROOT / "state" / "scorecard_history.csv"
+    if scorecard_csv.exists():
+        pull(
+            "dq_scorecard",
+            f"select * from read_csv_auto('{scorecard_csv.as_posix()}', header=true)",
+        )
+    else:
+        print(f"note: {scorecard_csv} not found — dq_scorecard falling back to the current snapshot only")
+        pull("dq_scorecard", "select * from main.fct_data_quality_checks")
     pull("dq_settlement_completeness", "select * from main.dq_detector_settlement_completeness")
     pull("dq_vocabulary_drift", "select * from main.dq_detector_vocabulary_drift")
     pull("dq_mass_touch", "select * from main.dq_detector_mass_touch where fired")

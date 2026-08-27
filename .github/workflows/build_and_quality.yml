@@ -1,0 +1,196 @@
+name: Build, Quality, and Dashboard Refresh
+
+# C6.4 — dbt build (models, contracts, unit tests, data tests, the five
+# detectors + scorecard) against the S3-native bronze table, then Soda,
+# strictly sequential (never parallel — H3.1(c): Soda hard-fails in ~0.065s
+# if it overlaps a dbt build holding the same DuckDB file, it does not queue).
+#
+# C6.5 — dashboard refresh runs as LATER STEPS IN THIS SAME JOB, not a
+# separate workflow/job: build_dashboard_source.py needs the ~600MB
+# dbt/target/openledger_prod.duckdb this job's dbt build just produced.
+# Passing that file to a separate job/workflow would mean an
+# upload-artifact + download-artifact round trip of the whole ~600MB file —
+# the exact "moving a large blob to move a small delta" cost C6.1 already
+# rejected for bronze, except here there isn't even a cheaper alternative
+# (this file is this run's own ephemeral output, not accumulated state) — so
+# same-job steps, reading the file directly off the runner's local disk, are
+# strictly cheaper than the artifact round trip with no correctness downside.
+#
+# Runs after Ingest completes successfully (workflow_run) — never before, so
+# it always reads bronze at-or-after that run's watermark. Also
+# workflow_dispatch for manual/independent testing (C6.7) against whatever
+# bronze state already exists in S3, without needing to re-run ingest first.
+
+on:
+  workflow_run:
+    workflows: ["Ingest"]
+    types: [completed]
+  workflow_dispatch: {}
+
+jobs:
+  build_and_quality:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+      # C6.4: points dbt's iceberg_scan() at the S3-native bronze table
+      # instead of the local (gitignored, nonexistent-on-a-fresh-runner) path.
+      BRONZE_WAREHOUSE_ROOT: s3://openledger-lakehouse-025044153778/warehouse/bronze/service_requests
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python (main env — dbt/MetricFlow)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      # Every later step invokes this env explicitly as ../.venv/bin/dbt and
+      # .venv/bin/python — never bare `python`/`pip`, because the Soda
+      # setup-python step below repoints PATH's `python` at 3.11. So the main
+      # env must be a real, self-contained venv on disk, created here from the
+      # 3.14 interpreter that setup-python just put on PATH. (Previously this
+      # step was a bare `pip install` and .venv was never created — it only
+      # worked on a dev machine that happened to have one. A fresh runner had
+      # no .venv and every dbt/dashboard step failed.)
+      - name: Create main venv and install dependencies
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -r requirements.txt
+
+      - name: Set up Python (Soda env — separate, incompatible DuckDB pin)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # .venv/bin/python keeps working after this: a venv's bin/python is a
+      # symlink to the specific 3.14 binary in the hosted toolcache, which
+      # stays on disk — the PATH change from the step above doesn't touch it.
+      - name: Install Soda dependencies into a separate venv
+        run: |
+          python3.11 -m venv .venv-soda
+          .venv-soda/bin/pip install -r requirements-soda.txt
+
+      # Defensive, not load-bearing here: a fresh checkout has no dbt/target/
+      # at all, so there is no stale partial_parse.msgpack to clear. Kept
+      # explicit anyway per the constraint table (Phase 3x2, Phase 4) in case
+      # a future change ever introduces target/ caching between runs.
+      - name: Clear any stale partial-parse cache
+        run: rm -f dbt/target/partial_parse.msgpack
+
+      # dbt is invoked through scripts/dbt_guard.sh, never directly: the
+      # guard exits nonzero before dbt starts if the invocation carries a
+      # --full-refresh (flag or DBT_FULL_REFRESH env). A full refresh here
+      # would re-scan all 808 S3 bronze objects (~140s/model, C6.4) and,
+      # historically, wipe incremental state. Enforced, not just documented,
+      # because every other scheduling constraint in this project was
+      # eventually tripped by accident. See docs/decisions.md, C6.4.
+      - name: dbt build (models, contracts, tests, detectors, scorecard)
+        id: dbt_build
+        run: (cd dbt && ../scripts/dbt_guard.sh build --profiles-dir . --target prod)
+
+      - name: dbt source freshness
+        run: (cd dbt && ../scripts/dbt_guard.sh source freshness --profiles-dir . --target prod)
+
+      # Only after dbt build has fully released target/openledger_prod.duckdb
+      # (the step above already completed and exited) — never concurrent
+      # (H3.1(c)).
+      - name: Soda scan
+        run: .venv-soda/bin/python quality/run_soda.py
+
+      # C6.5 (Variant B) — fct_data_quality_checks emits only today's
+      # snapshot; the cross-run trend lives in state/scorecard_history.csv
+      # (git-tracked, restored on checkout) because the marts DuckDB this
+      # build produced is never persisted between runs. This step merges
+      # today's snapshot in: idempotent (today's rows keyed on
+      # check_name/grain/run_date, replaced in place on a re-run — a job
+      # that reruns after a later-step failure does not double-write),
+      # crash-safe (writes a temp file, atomic os.replace), bounded (180-day
+      # trailing window). Proven in docs/decisions.md, C6.5.
+      - name: Append today's scorecard snapshot to history
+        run: .venv/bin/python scripts/append_scorecard_history.py
+
+      # C6.5 — rebuild the pruned dashboard source from the marts this job
+      # just built, then push. The push IS the trigger (Vercel's git
+      # integration rebuilds on push to main; no deploy-hook call needed —
+      # C5.8, proven in Phase 5). No data-change gate on the push itself:
+      # C5.8 already found pruned-file bytes differ on every rebuild
+      # regardless of content, so a byte/hash diff is not a meaningful
+      # signal either way — gating on it would add complexity to skip an
+      # operation (a Vercel static rebuild) that is already free and fast.
+      # The real signal that this refresh should happen at all is that the
+      # pipeline reached this step: ingest + build + quality all passed.
+      - name: Rebuild dashboard source from prod marts
+        run: .venv/bin/python scripts/build_dashboard_source.py
+
+      - name: Commit and push the pruned dashboard source + scorecard history
+        id: push_dashboard
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # The pruned DuckDB bytes differ on every rebuild regardless of
+          # content (C5.8), so it will essentially always stage. The
+          # scorecard history CSV is added alongside it — one push carries
+          # both the dashboard refresh and the day's appended trend row.
+          # The .tmp sibling of the CSV (only present if a prior run crashed
+          # exactly at the atomic rename) stays gitignored — never staged.
+          git add dashboard/sources/openledger/openledger.duckdb state/scorecard_history.csv
+          if git diff --cached --quiet; then
+            echo "No dashboard/scorecard changes to commit."
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+          else
+            git pull --ff-only
+            git commit -m "Dashboard: refresh pruned source + scorecard history ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+            git push
+            echo "pushed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # C6.5: confirm the deploy actually happened rather than fire-and-forget
+      # (a fire-and-forget push with no verification can fail silently if
+      # Vercel's build breaks). This is a liveness/identity check, not a
+      # full data-correctness reconciliation — matching phase-6.md's own
+      # division of labor: H6.3 (a human watching the first real run) is
+      # where "the dashboard re-rendered with correct data" gets verified;
+      # this step only proves the site is up and is OpenLedger's build, not
+      # a broken/error page, after every push.
+      - name: Verify the live dashboard is up after redeploy
+        if: steps.push_dashboard.outputs.pushed == 'true'
+        run: |
+          for i in $(seq 1 12); do
+            if curl -fsS --max-time 10 https://openledger-three.vercel.app/ -o /tmp/live.html; then
+              if grep -q "OpenLedger" /tmp/live.html; then
+                echo "Live dashboard reachable and looks like OpenLedger."
+                exit 0
+              fi
+            fi
+            echo "Not ready yet (attempt $i/12), waiting 10s..."
+            sleep 10
+          done
+          echo "::error::Dashboard did not come back up after the redeploy push."
+          exit 1
+
+      # C6.6 — notification. GitHub emails the repo owner on a failed run
+      # natively; this makes the run summary name the failing stage so the
+      # email is actionable without opening the logs. Unlike the ingest
+      # workflow there is no "benign alarm" class here — every failure in
+      # build/quality/dashboard is a real problem that blocks the refresh.
+      - name: Explain the failure in the run summary
+        if: ${{ failure() }}
+        run: |
+          {
+            echo "## 🔴 Build / quality / dashboard-refresh failed"
+            echo ""
+            echo "One of: dbt build (models, contracts, unit tests, detectors),"
+            echo "\`dbt source freshness\`, the Soda scan, the scorecard-history"
+            echo "append, the dashboard-source rebuild, or the post-deploy"
+            echo "liveness check. The marts and the live dashboard were NOT"
+            echo "refreshed this run. See the failing step above."
+            echo ""
+            echo "If it was the guard (\`dbt_guard.sh\`, exit 2): a \`--full-refresh\`"
+            echo "reached a CI dbt call — remove it (docs/decisions.md, C6.4)."
+          } >> "$GITHUB_STEP_SUMMARY"

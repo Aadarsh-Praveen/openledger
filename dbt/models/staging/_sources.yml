@@ -17,7 +17,10 @@ sources:
           # (relation.py: "if '(' not in ext_location ... treat as a raw
           # expression"), rendered via project Jinja before that — see
           # macros/bronze_scan.sql for the one place this expression lives.
-          external_location: "iceberg_scan('{{ var(\"bronze_warehouse_root\") }}', allow_moved_paths => true)"
+          # C6.4: BRONZE_WAREHOUSE_ROOT env var lets the scheduled CI build
+          # point at the S3-native table (C6.1) instead of the local path —
+          # unset locally, so dev behavior is unchanged.
+          external_location: "iceberg_scan('{{ env_var('BRONZE_WAREHOUSE_ROOT', var(\"bronze_warehouse_root\")) }}', allow_moved_paths => true)"
         loaded_at_field: updated_at
         freshness:
           # Provisional thresholds for `dbt source freshness` (Phase 6 wires

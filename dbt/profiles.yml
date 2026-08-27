@@ -8,12 +8,24 @@ openledger:
       path: 'target/openledger_dev.duckdb'
       extensions:
         - iceberg
+        - httpfs
       settings:
         unsafe_enable_version_guessing: true
+        # C6.4: empty-string defaults are inert for local dev (bronze_warehouse_root
+        # stays a local path, so these are never read) — verified live that empty
+        # SET s3_* pragmas don't affect a local-path iceberg_scan. In CI these are
+        # the same AWS_* secrets already used for the S3 ingest step (C6.1/C6.3).
+        s3_region: "{{ env_var('AWS_DEFAULT_REGION', '') }}"
+        s3_access_key_id: "{{ env_var('AWS_ACCESS_KEY_ID', '') }}"
+        s3_secret_access_key: "{{ env_var('AWS_SECRET_ACCESS_KEY', '') }}"
     prod:
       type: duckdb
       path: 'target/openledger_prod.duckdb'
       extensions:
         - iceberg
+        - httpfs
       settings:
         unsafe_enable_version_guessing: true
+        s3_region: "{{ env_var('AWS_DEFAULT_REGION', '') }}"
+        s3_access_key_id: "{{ env_var('AWS_ACCESS_KEY_ID', '') }}"
+        s3_secret_access_key: "{{ env_var('AWS_SECRET_ACCESS_KEY', '') }}"

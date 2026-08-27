@@ -35,6 +35,12 @@ BATCH_BOUNDARY_ANCHOR_UTC_HOUR = 3  # clears the observed 01:33-02:03 UTC cluste
 MAX_RETRIES = 5
 RETRY_BACKOFF_BASE_SECONDS = 2
 
+# C6.2: alarm after this many consecutive scheduled runs with no watermark
+# advance. At a daily cron, 2 = ~48h of silence — one quiet day fits the
+# observed steady-state/publish-lag distribution (see docs/decisions.md);
+# two in a row does not.
+STALENESS_ALARM_THRESHOLD = 2
+
 RAW_DIR = ROOT / "raw"
 STATE_DIR = ROOT / "state"
 RAW_DIR.mkdir(exist_ok=True)
@@ -46,6 +52,15 @@ WAREHOUSE_DIR = ROOT / "warehouse"
 BRONZE_NAMESPACE = "bronze"
 BRONZE_TABLE = "service_requests"
 BRONZE_TABLE_ID = f"{BRONZE_NAMESPACE}.{BRONZE_TABLE}"
+
+# C6.1: the S3-native bronze catalog seeded by scripts/seed_bronze_to_s3.py.
+# Same catalog name ("openledger") as the local catalog is deliberate —
+# PyIceberg's SqlCatalog scopes tables by catalog_name in its own metadata
+# tables; a mismatched name here caused a false NoSuchTableError during the
+# atomicity test (see docs/decisions.md, C6.1 build requirement 3).
+S3_BUCKET = "openledger-lakehouse-025044153778"
+S3_WAREHOUSE_ROOT = f"s3://{S3_BUCKET}/warehouse"
+S3_CATALOG_DB = STATE_DIR / "s3_catalog.db"
 
 WATERMARK_FIELD = ":updated_at"
 ORDER_TIEBREAKER = "unique_key"

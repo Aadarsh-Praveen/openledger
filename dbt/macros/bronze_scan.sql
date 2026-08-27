@@ -14,6 +14,8 @@
   exactly one place to change the actual path — this macro exists for any
   ad-hoc analysis/script that needs the same scan expression outside a
   dbt source context, where macro calls do resolve normally.
+  C6.4: also honors BRONZE_WAREHOUSE_ROOT, same as _sources.yml, so any
+  ad-hoc use of this macro against the S3-native table stays consistent.
 #}
-iceberg_scan('{{ var("bronze_warehouse_root") }}', allow_moved_paths => true)
+iceberg_scan('{{ env_var("BRONZE_WAREHOUSE_ROOT", var("bronze_warehouse_root")) }}', allow_moved_paths => true)
 {% endmacro %}

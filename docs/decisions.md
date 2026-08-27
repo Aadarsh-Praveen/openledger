@@ -3683,3 +3683,853 @@ C5.1/C5.6's original reconciliation work; 7 survived a real failure
 first (the initial deploy 404'd because nothing had been pushed and the
 Root Directory wasn't set) and is now independently re-confirmed live,
 not just trusted from the user's report.
+
+---
+
+# Phase 6 — Orchestration: GitHub Actions Pipeline
+
+## C6.1 — State persistence design (proposed 2026-08-26; STOP for H6.1, no workflow YAML written)
+
+**What actually needs to persist between ephemeral runner instances,
+verified against current real sizes, not the Phase 1 figures from
+memory** (`du -sh`, `pyiceberg` snapshot inspection, run live today):
+
+| State | Current size | Grows how fast | Can it be rebuilt instead of persisted? |
+|---|---:|---|---|
+| `state/watermark.json` | 105 bytes | Trivial | No — it's the only record of ingestion progress |
+| `state/backfill_checkpoint.json` | 12.5 KB | Trivial | No — same reason |
+| Iceberg bronze (`warehouse/` + `catalog/catalog.db`) | **1.7 GB on disk**, but only **733 MB (1,892 files) is the current live snapshot** | ~12K rows/day steady state; superseded-file bloat separately, see below | No — MERGE needs the existing table; re-backfilling 24 months every run defeats the entire incremental design |
+| DuckDB marts (`dbt/target/openledger_prod.duckdb`) | 600 MB | N/A | **Mostly yes** — every mart except `fct_data_quality_checks` is a `table` materialization, fully rebuilt from bronze every `dbt build`. Only `fct_data_quality_checks`'s **accumulated history** (currently 206 rows / 2 run_dates) is genuinely irreplaceable — an incremental model reading a freshly-created empty table can't recover yesterday's snapshot rows from anywhere |
+
+**A real complication found doing this sizing, not anticipated from the
+phase brief**: Phase 1's `docs/decisions.md` already flagged that
+PyIceberg 0.11.1's `expire_snapshots()` deletes only snapshot-log
+entries, never physical files, and projected ~23.6 GB/year of superseded-file
+growth "if untouched." It has not been touched since — `warehouse/` now
+holds 4,713 Parquet files (1.7 GB) for a table whose current snapshot
+needs only 1,892 of them (733 MB). **~950 MB, more than half of what's on
+disk, is pure waste**, and it compounds with every MERGE regardless of
+whether Phase 6 exists. This matters directly for the persistence
+decision: whichever mechanism holds the warehouse between runs will be
+uploading/downloading this waste every single scheduled run, and the
+waste grows faster than the live data does.
+
+### Options evaluated
+
+**1. Commit to git.** Fine and recommended for the two tiny state files
+(a scheduled job committing its own `watermark.json`/`checkpoint.json`
+back to `main` is a normal, transparent pattern, and it gives a free,
+readable history of watermark advancement over time — a real audit
+trail, not just a mechanism). **Ruled out for the warehouse**: even
+without the bloat problem, an object that changes every run and is
+hundreds of MB to a low-GB is exactly what git repositories are bad at
+holding — every commit would carry the full delta forever in history,
+and 731 MB was already flagged in the phase brief as too large. The
+1.7 GB reality makes this worse, not better.
+
+**2. S3.** Would work, and cost is genuinely trivial (~$0.02-0.05/month
+for ~1-2 GB at S3 Standard rates) — but **this is exactly the sequencing
+collision phase-6.md asks to flag before building anything**: Phase 7's
+entire deliverable is an S3 + Glue + Athena mirror of this same bronze
+table. Standing up a bucket now, for pure state-blob storage, creates a
+real choice Phase 7 would then have to make — reuse Phase 6's
+state-storage bucket for the Iceberg mirror (coupling two different
+concerns, "CI scratch state" and "the résumé-phrasing cloud artifact,"
+into one bucket with two different retention/lifecycle needs), or stand
+up a second bucket (contradicting the phase's own goal of not creating
+two buckets for one thing). Neither is clean. **Not recommended for
+Phase 6**, specifically to avoid this.
+
+**3. GitHub Actions artifacts.** **Recommended.** Verified directly
+against current GitHub documentation before recommending, not assumed
+from training-era knowledge (products/pricing pages change): standard
+GitHub-hosted runner minutes AND artifact/cache storage are **free and
+unlimited for public repositories** — the 500 MB storage / 2,000
+minutes / 10 GB cache figures are the *private*-repo Free-plan limits;
+`gh repo view` already confirmed this repo is public. Zero dollar cost,
+zero new cloud infrastructure, and — directly answering the sequencing
+concern — **zero bucket created now for Phase 7 to later coordinate
+around.** `actions/upload-artifact` at the end of each ingest run,
+`actions/download-artifact` (by name, from the most recent successful
+run) at the start of the next, holding a tarball of `warehouse/` +
+`catalog/catalog.db`.
+
+### Recommendation
+
+- **`state/watermark.json` and `state/backfill_checkpoint.json`**:
+  committed to git directly by the scheduled workflow at the end of each
+  run (small, meaningful diffs; free audit trail).
+- **Iceberg bronze (`warehouse/` + `catalog/`)**: GitHub Actions
+  artifact, restored at the start of each run, re-uploaded at the end.
+  No S3, no new bucket, sidesteps the Phase 7 sequencing collision
+  entirely.
+- **DuckDB marts**: **not persisted as a whole.** Rebuilt fresh from
+  restored bronze via `dbt build` every run (this is already how 4 of 5
+  marts work; nothing is lost). Only `fct_data_quality_checks`'s
+  accumulated row history is exported to a small Parquet file
+  (currently 206 rows — trivial size, grows by ~100 rows/day) and
+  persisted the same way as the tiny state files or bundled into the
+  bronze artifact; the incremental model is seeded from it before
+  `dbt build` runs each time, so the scorecard's day-over-day trend
+  survives a fully-rebuilt marts file. (The exact seeding mechanism —
+  load the Parquet into a fresh table before dbt's incremental
+  merge logic runs — is a C6.4 implementation detail once this design
+  is approved, not decided further here.)
+
+**A decision this recommendation surfaces but does not resolve — for
+H6.1 to weigh in on explicitly**: the superseded-file bloat (950 MB of
+waste today, growing ~23.6 GB/year unaddressed per Phase 1's own
+projection) makes the artifact bigger and slower to move every single
+day, independent of anything Phase 6 does. Two honest paths, not a false
+choice: (a) accept it as a known, worsening limitation for Phase 6's
+lifetime, on the reasoning that Phase 7's S3 migration is likely to
+start from a clean copy-and-register rather than replicate every
+orphaned file, making this moot once Phase 7 lands; or (b) add a small
+orphan-Parquet cleanup step to Phase 6's scope now (list files referenced
+by the current snapshot's manifest, delete `warehouse/` files not in
+that set, before each artifact upload) — real new engineering PyIceberg
+doesn't provide natively, sized at maybe an hour, but scope Phase 6's
+brief didn't originally ask for. Recommending (a) — defer, don't scope-
+creep Phase 6 to fix a Phase-1-era finding — but flagging (b) explicitly
+rather than silently picking one.
+
+**Sequencing flag, answered directly per the request**: this
+recommendation creates **no S3 bucket in Phase 6**. Phase 7 remains free
+to create exactly one bucket for the Iceberg mirror with no prior
+Phase 6 infrastructure to reconcile against, coordinate with, or migrate
+away from.
+
+## C6.1 — CORRECTION (2026-08-26, same day): the artifacts recommendation was wrong; S3 in Phase 6 instead
+
+**H6.1 approved the state-files-to-git and marts-rebuilt-fresh pieces of
+the original recommendation; rejected the GitHub-Actions-artifacts piece
+for bronze**, on two compounding grounds — both hold up under actual
+verification, not just plausible-sounding:
+
+1. **Artifacts/cache are whole-blob mechanisms; every run pays for the
+   full warehouse size, not the day's change.** Verified against current
+   GitHub docs, not assumed: artifact default retention is **90 days**
+   (max without an org/enterprise override); `actions/cache` caps at
+   **10GB per repository** (evictable once exceeded) with unused entries
+   evicted after **7 days** — a daily cron sidesteps the 7-day rule
+   specifically, but not the 10GB ceiling, which the warehouse is
+   trending toward. Real transfer-time data point found for a
+   near-identical size: a 2020 GitHub issue reports **~1.7GB → ~12 min
+   upload, ~42s download** on `upload-artifact` v1/v2. GitHub's own
+   v4 announcement claims up to 96%/80% upload/download improvements in
+   worst-case scenarios, which would put a modern estimate around
+   **1-2.5 minutes total transfer per run** — but that's an extrapolation
+   from a marketing percentage, not a measurement, and I'm not treating
+   it as one. Either figure, the mechanism is O(total warehouse size),
+   not O(daily change).
+2. **The bloat compounds this, not orthogonally.** 950MB of today's
+   1.7GB is superseded/orphaned (C6.1's original entry). Every run under
+   an artifact/cache design re-transfers that waste twice. The user's
+   framing is exactly right: two O(warehouse-size) costs (transfer +
+   the ever-growing bloat) multiply, not add — by the time the warehouse
+   reaches a few GB, a run doing real work on ~12k rows/day is moving
+   multiple GB to do it.
+
+**The structural fix, not just a cheaper venue for the same mechanism**:
+S3 doesn't help because it's "durable" instead of "90-day retention" —
+it helps because **PyIceberg writing directly to `s3://` paths (real
+Iceberg-on-S3, not S3-as-backup-blob for a locally-catalogued table)
+converts the transfer cost from O(total warehouse size) to O(daily
+delta)**. Iceberg's own MERGE only touches the partitions a run actually
+changes (already proven in Phase 1, C1.5's 38.8x partition-scoped-upsert
+finding) — an incremental run against an S3-native table reads a handful
+of small metadata/manifest files plus the specific partitions being
+upserted, and writes only the new data files for those partitions. At
+~11,905 rows/day steady state, that's low single-digit MB moved per run,
+**not proportional to the warehouse's total size at all**, whether the
+warehouse is 1.7GB today or 10GB in a year. This is not true of either
+artifacts or `actions/cache` — both are opaque tarballs with no partial-
+update capability, so both stay O(total size) forever, cheaper venue or not.
+
+**Cost, verified against current pricing, not recalled**: S3 Standard
+is **$0.023/GB/month** (confirmed live, unchanged from historical
+pricing). At the current 1.7GB: **~$0.04/month** storage. AWS's data-
+transfer-out free tier is **100GB/month, permanent, not a 12-month
+signup perk** (confirmed live) — even a *naive* full-blob daily sync
+(1.7GB × 30 ≈ 51GB/month) would stay under it today, and the real
+incremental-sync design uses a tiny fraction of that regardless of how
+large the warehouse grows. Request costs (PUT ~$0.005/1,000) for a
+handful to low hundreds of objects per run round to a fraction of a
+cent. **Total: under $0.05/month now, growing slowly with data volume —
+not with the bloat**, since real compaction becomes possible once
+Phase 7's Athena OPTIMIZE/VACUUM can run against this same table (see
+below) — something the local PyIceberg 0.11.1 setup was already shown
+(Phase 1) to be structurally incapable of, S3 or not.
+
+**Comparison table, the actual decision**:
+
+| | GitHub Actions artifacts | `actions/cache` | S3 (Iceberg-native) |
+|---|---|---|---|
+| Retention | 90 days default, evictable | 10GB/repo cap, 7-day-unused eviction | Durable, no expiry |
+| Per-run transfer | O(whole warehouse), ~1-13 min (v4 estimate vs. 2020-measured) | Same mechanism as artifacts | O(daily delta), likely single-digit seconds |
+| Cost | $0 (public repo) | $0 (public repo) | ~$0.04/month now, under the free egress tier |
+| Gets worse as bloat grows? | Yes, directly | Yes, and risks the 10GB cap | No — transfer cost is delta-based, independent of total size |
+| Sets up Phase 7? | No — still needs a real S3 migration later | No | **Yes** — same bucket, same `s3://` paths, Phase 7 registers in Glue rather than migrating |
+
+**What Phase 6 does NOT take on from Phase 7, to keep the pulled-forward
+scope small and honest**: actual snapshot expiration / orphan-file
+compaction. That needs Athena's `OPTIMIZE`/`VACUUM` (server-side,
+Iceberg-aware compaction that PyIceberg 0.11.1's Python API cannot do —
+this was never a "local vs. S3" limitation, it's a library capability
+gap, and moving the files to S3 alone does not fix it), which requires
+Glue Data Catalog registration, Athena access, and a **per-query
+scan-limit workgroup guardrail** — a HUMAN-ONLY AWS-spend decision
+already flagged in CLAUDE.md's own known-traps table, explicitly
+Phase 7's job. **Phase 6's actual pulled-forward scope: one S3 bucket,
+IAM credentials for GitHub Actions, and PyIceberg reconfigured to write
+`s3://` paths instead of local ones.** The bloat keeps existing until
+Phase 7 runs `OPTIMIZE`/`VACUUM` against it — but it stops *compounding
+transfer cost* the moment writes go directly to S3, which is the actual
+problem this decision is solving.
+
+**Bucket reuse for Phase 7, confirmed structurally, not just asserted**:
+Phase 7's deliverable is "the same bronze table, Athena-queryable" —
+concretely, registering an existing `s3://` Iceberg table in Glue Data
+Catalog. If Phase 6's bucket already holds a real Iceberg table at
+`s3://<bucket>/warehouse/bronze/service_requests/` (mirroring the
+existing local partition layout, which CLAUDE.md's own locked decision
+table already chose specifically "to mirror the eventual S3 prefix
+structure" — a decision made in Phase 1 for exactly this moment),
+Phase 7's job becomes register-in-Glue, not copy-then-register. Directly
+addresses the sequencing flag: one bucket, created once, in Phase 6,
+reused unchanged by Phase 7.
+
+**Revised recommendation, superseding the artifacts piece of the
+original C6.1 entry**: S3, Iceberg-native (PyIceberg writing directly to
+`s3://` paths via its S3 file I/O, not a blob-sync of the local
+directory). The catalog (`catalog/catalog.db`, 20KB) stays with the
+other tiny state files — committed to git each run, same as
+`watermark.json`/`checkpoint.json` — since it's small and a single
+scheduled cron has no concurrency to coordinate. New GitHub secret
+needed beyond the Socrata token: AWS credentials scoped to this one
+bucket (H6.2). **Still no workflow YAML written** — this is the design
+correction for H6.1 to approve before any is.
+
+---
+
+**H6.1 — APPROVED (2026-08-26).** S3, Iceberg-native, O(delta) transfer.
+Scope boundary confirmed: Phase 6 = bucket + IAM + PyIceberg→`s3://`;
+snapshot expiration/`OPTIMIZE`/`VACUUM` stay Phase 7. Six requirements
+given for the build; all six proven for real below, not asserted.
+
+## C6.1 build — the six requirements, proven
+
+**Real AWS infrastructure was created this session** (this repo owner's
+account, `025044153778`, `us-east-2`) — every resource is named, tagged,
+and reported here:
+- S3 bucket `openledger-lakehouse-025044153778`: public access fully
+  blocked (all four block-public-access settings `true`), SSE-S3 default
+  encryption enabled, tagged `project=openledger`,
+  `purpose=iceberg-bronze-state-phase6`.
+- IAM managed policy `openledger-bronze-s3-access`
+  (`arn:aws:iam::025044153778:policy/openledger-bronze-s3-access`).
+- IAM user `github-actions-openledger`, this policy attached, one access
+  key issued.
+
+### 1. IAM least-privilege — proven, not just written
+
+Policy (also saved for the record — this is the exact JSON, unedited):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "OpenledgerBronzeBucketLevel",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
+      "Resource": "arn:aws:s3:::openledger-lakehouse-025044153778"
+    },
+    {
+      "Sid": "OpenledgerBronzeObjectLevel",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject", "s3:PutObject", "s3:DeleteObject",
+        "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"
+      ],
+      "Resource": "arn:aws:s3:::openledger-lakehouse-025044153778/*"
+    }
+  ]
+}
+```
+
+No `iam:*`, no other bucket, no wildcard resource. **Verified live, not
+just read back**, using the actual issued credentials (not the admin
+credentials that created them): confirmed identity resolves to
+`github-actions-openledger`; confirmed a real write+read+delete succeeds
+against the target bucket; confirmed `AccessDenied` attempting
+`s3:ListBucket` against a *different*, unrelated bucket already in this
+account (`amazon-electronics-dataset`); confirmed `AccessDenied`
+attempting `iam:ListUsers`. The blast radius of this specific key, if
+leaked, is exactly one bucket's objects — nothing else in the account is
+reachable with it, demonstrated rather than assumed from the policy text
+alone.
+
+### 2. Credential logging — a real S3 auth failure triggered, output inspected
+
+Configured `PyIceberg`'s `SqlCatalog` with the real access key ID but a
+**deliberately wrong** secret, pointed at a real S3 path, and attempted a
+genuine write (`create_table` + `append`) to force an authentic AWS
+`ACCESS_DENIED`. Full traceback captured:
+```
+OSError: When getting information for key '.../test_table/metadata/....metadata.json'
+in bucket 'openledger-lakehouse-025044153778': AWS Error ACCESS_DENIED
+during HeadObject operation: No response body.
+```
+Grepped the complete output (traceback + all print statements) for both
+the real secret and the deliberately-wrong one used in the test —
+**zero matches for either.** PyArrow's S3 error path (which underlies
+PyIceberg's `PyArrowFileIO`) surfaces the bucket name and object key on
+auth failure, never the access key ID, secret, or any Authorization/
+signature material. This was checked directly, not inferred from "GitHub
+masks secrets" (which only covers values GitHub itself knows are
+secrets — it does nothing about a library choosing to print one).
+
+### 3. S3 write atomicity — killed mid-commit, on a throwaway prefix, table verified unharmed
+
+Reproduced PyIceberg's actual two-phase commit (`SqlCatalog.commit_table`,
+read directly from source before designing the test): phase one writes
+the *new* metadata.json to S3 (a new, uniquely-named file — never an
+overwrite); phase two is a local SQLite `UPDATE` swapping the catalog's
+`metadata_location` pointer to that new file. **The commit point is the
+SQLite transaction, not anything S3-side** — this is true whether the
+data files live locally or in S3; S3 only adds network latency to phase
+one, it doesn't change where the atomicity guarantee lives.
+
+Test: wrote a 3-row baseline (real commit, snapshot recorded) to a
+throwaway prefix (`_atomicity_test/` inside the real bucket, since a
+prefix is exactly what a bucket-scoped credential can address — deleted
+afterward). Monkeypatched an 8-second sleep between phase one and phase
+two, started a second write (2 more rows) as a background process,
+polled for confirmation that the new metadata.json had actually landed
+on S3, then `kill -9`'d the process mid-sleep — squarely inside the
+window between "new file exists on S3" and "catalog would have pointed
+at it."
+
+**Verified from a completely fresh Python process/connection afterward**:
+```
+row count: 3                              (not 5 — the second write is invisible)
+rows: only the 3 baseline rows            (no trace of the killed write's data)
+snapshot count (history): 1               (the killed write never entered history)
+current snapshot id: unchanged            (identical to pre-kill)
+metadata_location: the 00001 file         (NOT the 00002 file the killed process wrote)
+```
+The orphaned `00002-*.metadata.json` the killed process actually
+finished writing **does exist on S3** (confirmed via `aws s3 ls`) — it's
+harmless waste, never referenced by anything, the S3-native equivalent
+of the already-documented local superseded-file pattern. A run killed
+mid-write leaves the table exactly at its prior snapshot. Test prefix
+deleted after verification (`aws s3 rm --recursive`).
+
+### 4. The one-time seed — run as an explicit, watched, manual step
+
+`scripts/seed_bronze_to_s3.py`: reads the local bronze table's schema and
+partition spec directly from its own Iceberg metadata (no hand-copying,
+so no risk of a transcription mismatch), creates a new S3-native table
+with that exact schema/spec, and copies data across in the same 25
+monthly batches the original Phase 1 backfill used (bounded memory,
+visible progress, a natural retry unit — mirroring, not reinventing).
+
+**Two real bugs found and fixed running it for real, not left
+theoretical**:
+- DuckDB's Arrow round-trip re-typed `updated_at` from `timestamp[us,
+  tz=UTC]` to `timestamp[us, tz=America/New_York]` (the host machine's
+  local zone) — the exact same *class* of session-timezone-dependent bug
+  already found and fixed in `int_request_resolution.sql` (C3.3),
+  recurring here in a different script. Fixed with an explicit `SET
+  TimeZone='UTC'` before the Arrow conversion, not left to the session
+  default.
+- `unique_key` is `required` in the Iceberg schema; DuckDB's Arrow
+  conversion marks every column nullable regardless of the data. Fixed
+  by explicitly casting the batch's schema field to `nullable=False`
+  before each append — a metadata mismatch, not a real null anywhere in
+  the data.
+
+**Run for real, watched, this session** (not simulated): 25/25 monthly
+batches, **7,533,132 rows written in 143 seconds.** Run as a standalone
+script invocation, explicitly separate from any scheduled workflow —
+exactly as required. `state/s3_catalog.db` (20KB) is the new table's
+catalog — committed to git alongside `watermark.json`/`checkpoint.json`,
+per the original C6.1 design.
+
+### 5. Reconciliation — three independent methods, not one
+
+| Method | Row count |
+|---|---:|
+| Seed script's own running total | 7,533,132 |
+| Fresh PyIceberg scan against S3 (separate process) | 7,533,132 |
+| DuckDB `iceberg_scan()` reading S3 directly (a completely different engine, bypassing PyIceberg's read path entirely) | 7,533,132 |
+| Local bronze (the number being matched against) | 7,533,132 |
+
+All four agree exactly. **A real, useful side effect of the seed,
+found not sought**: the S3 table is 808 objects / **740,842,401 bytes
+(~740MB)** — noticeably smaller than local bronze's 1.7GB, because a
+clean 25-batch append history carries none of the ~950MB of
+superseded-file waste the local table accumulated over many MERGE
+operations. The S3 table starts genuinely clean; the local one does not,
+and won't until Phase 7's `OPTIMIZE`/`VACUUM` runs. **Cost, measured
+against the real object**: 740MB × $0.023/GB/month ≈ **$0.017/month**
+storage; the one-time seed's ~808 PUT requests cost a fraction of a cent
+and happen exactly once.
+
+### 6. Watermark-advances-only-after-S3-confirms — the design principle for C6.3
+
+Not testable in isolation (there's no scheduled workflow yet to test) —
+recorded here as the binding design constraint C6.3 must implement,
+per the user's own framing: watermark is source-of-truth-for-"what's
+ingested," now living in a different place (git) than the data (S3);
+they must never be allowed to drift. **The ingest workflow's step order,
+fixed by this requirement**:
+1. Restore S3 catalog state (download `state/s3_catalog.db` from the
+   git-committed copy — already local after checkout, no extra step).
+2. Run the incremental ingest against the S3-native table. The Iceberg
+   commit itself (requirement 3's mechanism) is already atomic — the
+   table either advances to the new snapshot or stays exactly where it
+   was; there is no partial-write state to worry about at the S3 layer.
+3. **Only after the ingest step above returns success** (the S3 commit
+   already durable): compute and write the new `watermark.json`.
+4. Commit and push `watermark.json` (+ `checkpoint.json`, +
+   `state/s3_catalog.db` if the catalog changed) to git.
+5. If step 2 fails or the workflow is killed before it returns: the S3
+   table is unchanged (requirement 3's guarantee) AND `watermark.json`
+   is never touched — both stay at their last-known-good, consistent
+   pair. There is no code path where the watermark can advance without
+   the S3 write having already durably committed, because step 3 never
+   runs unless step 2 already returned success.
+
+This is the same "advance the pointer last" pattern already proven
+correct at the Iceberg-commit layer (requirement 3) and the Phase 1
+checkpoint layer — applied one level up, to the git/S3 pair specifically.
+
+## C6.2 — Staleness signal (designed and reported before implementation, per phase-6.md)
+
+`dbt source freshness` checks whether bronze *is* fresh; it can't tell you
+whether an incremental run's lack of new data is benign (publish cycle
+genuinely produced nothing) or a silent failure (data should exist but
+didn't arrive). Two distinct code paths in `run_incremental()`
+(`ingest/pipeline.py`) both produce "watermark unchanged," and needed to
+be unified into one signal:
+
+- **Short-circuit** (this run's window is identical to the last recorded
+  one) — returns immediately, `skipped=True`, watermark untouched.
+- **Real fetch, no advance** — a genuine query ran but
+  `max_watermark_seen` didn't exceed the stored watermark; `save_watermark`
+  is deliberately not called (existing, correct behavior, untouched).
+
+**Design:** a new state file, `state/staleness.json`, kept separate from
+`watermark.json` so `save_watermark`'s "write only on genuine advance"
+semantics aren't disturbed:
+
+```json
+{"consecutive_no_advance": 0, "last_advanced": true, "last_run_at": "..."}
+```
+
+`ingest/checkpoint.py` gained `record_run_outcome(advanced: bool)`:
+resets the counter to 0 on advance, increments otherwise, atomic-write via
+the existing `_atomic_write` helper. Called from both return points in
+`run_incremental()` — the short-circuit branch passes `advanced=False`
+explicitly; the real-fetch branch passes the same boolean already computed
+for the `save_watermark` guard. The result dict now carries a `staleness`
+key so the workflow can act on it without re-deriving anything.
+
+**Threshold: `STALENESS_ALARM_THRESHOLD = 2`** (`ingest/config.py`). The
+cron is daily, so 2 consecutive non-advancing runs ≈ 48h of silence. At
+the measured ~11,905 rows/day steady state plus the near-daily mass-touch
+pattern, a single quiet day fits the observed distribution — the New
+Year's low-activity week is documented precedent for a one-off dip from a
+delayed Socrata publish cycle. Two in a row does not fit that pattern.
+Threshold=1 would false-alarm on every ordinary single-day lag;
+threshold=3+ lets a real outage sit undetected for an extra cycle.
+
+**Verified live** (isolated from real state, via a throwaway staleness
+file): `record_run_outcome(False)` → 1, `record_run_outcome(False)` → 2,
+`record_run_outcome(True)` → 0 (resets), `record_run_outcome(False)` → 1.
+Counter behavior confirmed correct before wiring into the real pipeline.
+`ingest/pipeline.py` and `ingest/checkpoint.py` both import clean. The
+live end-to-end exercise of this path (a real scheduled/dispatched run
+actually tripping or clearing the alarm) happens under C6.7, where the
+ingest workflow itself is proven via `workflow_dispatch`.
+
+## C6.3 — The ingest workflow, and a real bug it surfaced
+
+**`OPENLEDGER_USE_S3` — an explicit opt-in switch, not creds-in-shell.**
+`ingest/bronze.py`'s `get_catalog()` defaults to the local file-backed
+catalog exactly as before; it only switches to the S3-native catalog
+(`ingest/config.py`'s new `S3_BUCKET`/`S3_WAREHOUSE_ROOT`/`S3_CATALOG_DB`)
+when `OPENLEDGER_USE_S3=1` is explicitly set. Deliberately not
+"switch automatically if AWS creds are present in the environment" — a
+local dev shell that happens to have AWS creds exported for an unrelated
+reason must never silently write to production S3. Same silent-divergence
+concern already guarded for `DBT_TARGET` (docs/versions.md). Verified live
+both ways: unset → local table, 7,533,132 rows; `OPENLEDGER_USE_S3=1` with
+real bucket-scoped-equivalent creds → the S3-native table, same row count.
+
+**A real bug, found by a genuine (not synthetic) crash.** While live-testing
+the CI entrypoint (`scripts/run_ingest_ci.py`) against S3, a real Socrata
+read timeout mid-fetch caused the process to be killed mid-run (not staged
+— an actual upstream timeout, "attempt 1/5... Retrying in 2s", then killed
+by the test harness after it ran far longer than expected). Investigated
+rather than dismissed as flakiness, per the project's standing rule to run
+down anomalies to a root cause. Found: the S3 table DID advance during the
+crashed run (3 new snapshots, +21 rows — each `scoped_upsert` call commits
+independently and atomically, so partial progress within an incomplete
+overall run is expected and fine) but `checkpoint.json`'s entry for that
+run was correctly left `status: "in_progress"` (never reached
+`mark_window_complete`), and `watermark.json` correctly never advanced —
+so far, exactly the intended C6.1 design holding under a real, not
+synthetic, interruption.
+
+The actual bug: retrying immediately afterward **short-circuited** instead
+of resuming the incomplete window — reporting "no new publish cycle since
+then" when the true prior attempt never finished. Root cause in
+`ingest/checkpoint.py`'s `get_latest_incremental_entry()` (present since
+the original Phase 1 commit `d04727b`, never triggered until now): its own
+docstring says it considers "complete or skipped" entries only, but the
+implementation's timestamp lookup was `w.get("completed_at") or
+w.get("skipped_at") or w.get("started_at")` — the `or started_at` fallback
+meant an `in_progress` entry (which only ever has `started_at`) was still
+picked up as a candidate and could be mistaken for "the most recent run,"
+false-positiving the no-op short-circuit on the very next attempt.
+
+**Fixed**: filter candidates to `status in ("complete",
+"skipped_no_new_window")` before ever looking at timestamps, matching what
+the docstring already claimed. Verified live: after the fix, a retry
+against the still-incomplete window correctly proceeded to a real fetch
+instead of short-circuiting (no `SHORT-CIRCUIT` log line). One side effect
+had to be cleaned up by hand: two more `skipped_no_new_window` checkpoint
+entries had already been recorded by the pre-fix code during earlier
+retries in this same investigation (each one legitimately shaped but
+built on the earlier bogus decision) — removed those two entries and reset
+`state/staleness.json` (its `consecutive_no_advance: 2` was pure test
+noise from these bogus skips, not a real staleness signal) before
+re-verifying. This was cleanup of artifacts from my own testing session,
+not of any real production state.
+
+**S3 read latency is real and non-trivial — a genuine operational cost,
+not a hang.** The multi-day catch-up this bug investigation required (the
+local watermark was 5 days stale from normal test-session gaps, not
+representative of daily steady-state volume) took long enough, across
+several retries, to repeatedly exceed this session's own tool-level
+execution time limits — not because anything was stuck, but because
+`scoped_upsert`'s partition-scoped scan against S3 (network GETs across
+the table's 808 objects) is measurably slower than the equivalent local-
+disk scan. This is the same class of cost already named for `dbt build`
+against S3 (see C6.4 below: 137.68s vs. 13.2s local, ~10x). At real daily
+cadence the per-run backlog is ~1 day + the 48h lookback buffer, not 5
+days, so this is expected to be a non-issue in steady-state operation —
+but it means a first-time catch-up after any extended pipeline downtime
+should be treated with the same care as the one-time bulk seed (C6.1
+requirement 4): watched, not assumed to finish within a short window.
+
+## C6.4 — Build + quality against S3, and the `dbt_project.yml` vars quirk
+
+**`dbt_project.yml`'s `vars:` values are NOT re-rendered as Jinja when read
+back via `var()`.** Attempted to make `bronze_warehouse_root` itself
+env-var-overridable by writing `"{{ env_var('BRONZE_WAREHOUSE_ROOT', '...')
+}}"` directly as the var's own value in `dbt_project.yml`. Verified live
+that this failed: the literal, unrendered Jinja text reached compiled SQL
+(`Parser Error: syntax error at or near "BRONZE_WAREHOUSE_ROOT"`) — dbt
+renders `vars:` values once when parsing the project file, but does not
+recursively re-render a string value that itself contains Jinja. **Fixed**
+by reverting `bronze_warehouse_root` to a plain path (as before) and
+instead wrapping `env_var('BRONZE_WAREHOUSE_ROOT', var("bronze_warehouse_
+root"))` at the two actual call sites (`models/staging/_sources.yml`'s
+`external_location`, and `macros/bronze_scan.sql`) — Jinja env_var() IS
+correctly rendered there, since those contexts render their own template
+text directly rather than reading a pre-resolved var string. Verified live
+both ways: unset → local path, full local `dbt build` unaffected (94/95
+pass, 1 pre-existing WARN, 13.20s — no regression); `BRONZE_WAREHOUSE_ROOT`
+set to the S3 path → `stg_service_requests` reads 7,533,132+ rows from S3.
+
+**DuckDB can read the S3-native Iceberg table directly, via plain
+`SET s3_region/s3_access_key_id/s3_secret_access_key` pragmas** — verified
+live, both the newer `CREATE SECRET (... PROVIDER credential_chain)` form
+and the older plain `SET` form return identical results against the same
+table. Chose the `SET` form for `dbt/profiles.yml`'s `settings:` block
+(already the mechanism used for `unsafe_enable_version_guessing`) with
+`env_var(..., '')` empty-string defaults — verified live that empty-string
+S3 settings are inert for a local-path `iceberg_scan()` (same row count,
+no error), so local dev is genuinely unaffected. CI supplies the same
+three `AWS_*` secrets already used for the S3 ingest step; no new secret
+type needed.
+
+**S3 read cost, quantified.** Full `dbt build` against the S3-native
+bronze table (all 13 models + tests): could not be measured standalone
+within this session's tool time limits (see C6.3 above), but the model
+layer alone (`dbt run --select stg_service_requests+`, all 13 models, no
+tests) measured at **137.68s**, vs. the equivalent **13.20s** against local
+bronze — **~10x**. Breakdown: the four models that materialize as tables
+and actually scan/aggregate bronze data dominate (`dim_agency` 28.25s,
+`dim_complaint_type` 16.93s, `dim_location` 17.01s, `fct_service_requests`
+67.60s); the view models and the five cheap pre-aggregated detectors are
+close to their local timings (each under ~1.5s). This is the real,
+measured baseline for CI's build step — not a guess, and not a defect;
+S3 GETs over the network are inherently slower than local disk reads
+across a table with 808 small objects, and this cost was already
+anticipated in principle by phase-6.md's own constraint table ("the
+Iceberg warehouse... live[s] on the runner's filesystem per-run, or must
+be persisted").
+
+**A real, currently-unresolved gap: the DQ scorecard's day-over-day
+history will not survive across scheduled CI runs.** `fct_data_quality_
+checks` is `materialized='incremental'` with `unique_key=['check_name',
+'grain', 'run_date']` — each build is meant to append that day's snapshot
+row alongside prior days' rows, preserved via dbt's incremental compare-
+against-existing-table logic. But `dbt/target/openledger_prod.duckdb` is
+never persisted between separate CI job runs (each runs on a fresh,
+ephemeral runner — the ~600MB file isn't committed to git, and nothing
+currently copies it to S3 or anywhere else durable, unlike bronze). So
+every scheduled run's `dbt build` starts from an empty target database,
+and dbt's incremental logic degrades to "insert everything as new" —
+correctly capturing *today's* full, correct detector results (the
+detectors themselves always recompute their complete pre-aggregated
+series from current bronze, per the Phase 3 finding this reuses), but
+**silently discarding every previous day's scorecard row**, since those
+only ever existed in a prior, already-discarded ephemeral runner's local
+file. Not fixed as part of C6.4 — out of the phase's stated scope (C6.4
+lists "the five detectors run and land in the scorecard" as a build step,
+not a cross-run persistence requirement), and the right fix (persist the
+scorecard's own small output — e.g., to S3 alongside bronze, or a
+git-committed export — and reload it before each build) is itself a small
+version of the exact state-persistence problem C6.1 already solved for
+bronze. Flagged for a decision rather than silently built or silently
+ignored.
+
+---
+
+## C6.4 follow-up — the scorecard-history gap: RESOLVED (Variant B), and `--full-refresh` now enforced-off in CI
+
+The gap flagged above (the DQ scorecard's day-over-day history does not
+survive across ephemeral CI runs) was taken to the user as a design
+decision with three options: persist the scorecard table to S3 like
+bronze; commit it to git like the state files; or export/reseed it each
+run. **Approved: Variant B — the git-committed CSV is the single source of
+truth; each build appends today's snapshot, deduped on
+`(check_name, grain, run_date)`.**
+
+Reasoning for B over the alternatives:
+- The scorecard history *is* state with the exact profile C6.1 already
+  solved for the watermark — small, slow-growing, must be durable and
+  consistent, read at run start / written at run end. Reusing the same
+  git-committed-state mechanism keeps **one** persistence pattern, not two.
+- Option A (S3) drags an S3 read-back-then-write-back into every build
+  step (the ~10x S3 read latency measured in C6.4), needs its own tiny
+  catalog or a parquet round-trip, mixes derived quality output into the
+  *source-data* bucket, and is arguably Phase 7 scope creep.
+- Option 3 via `actions/cache` / cross-run artifacts is best-effort
+  storage (cache eviction, artifact retention) — wrong for a
+  system-of-record trend. Done properly it collapses into B anyway.
+- Bonus: the DQ trend becomes a diffable artifact in git history.
+
+**Why NOT keep it incremental and seed-back (Variant A):** the user's
+call, and the right one — a "load the prior CSV into the fresh target DB
+so dbt's incremental merge has a base" step is hidden cross-step state of
+exactly the class this project has already been bitten by
+(`partial_parse.msgpack`, the `is_settled` session-timezone bug). Variant
+B has no hidden state: the model emits one snapshot, a script appends it,
+the file is the whole truth.
+
+### What changed
+
+- `dbt/models/marts/fct_data_quality_checks.sql`: `materialized='incremental'`
+  (with `unique_key` + `delete+insert`) → `materialized='table'`. The model
+  body already only ever emitted the current run's snapshot (it has no
+  `is_incremental()` branch), so this is purely dropping the accumulation
+  that never worked in CI anyway. Its two singular tests
+  (`assert_dq_scorecard_grain_unique`, `assert_dq_scorecard_contract_counts_match_schema`)
+  already scope to `max(run_date)` and pass unchanged; all 10 schema/data
+  tests on the model pass against the `table` build.
+- `scripts/append_scorecard_history.py` (new): reads today's snapshot from
+  `dbt/target/openledger_prod.duckdb`, merges it into
+  `state/scorecard_history.csv`, atomic-replaces the file.
+- `scripts/build_dashboard_source.py`: `dq_scorecard` is now read from
+  `state/scorecard_history.csv` (the full trend) when it exists, falling
+  back to the single current snapshot from the marts for a fresh local
+  checkout that hasn't appended yet.
+- `dashboard/pages/data-quality.md`: "The full scorecard" table now filters
+  to `run_date = (select max(run_date) …)` — it was already meant to be a
+  single snapshot, and without the filter a multi-day CSV would show one
+  row per check per day. Added a small `scorecard_trend` section (two
+  line charts: *checks not passing* and *pass rate %* by `run_date`) —
+  the visible payoff of keeping history.
+- `.gitignore`: `!state/scorecard_history.csv` added to the un-ignore
+  list. The `.csv.tmp` sibling stays ignored by `state/*`.
+- No pre-seeded CSV is committed. The first CI `build_and_quality` run
+  creates it from S3-backed marts — a local seed would bake in a
+  stale-local-bronze artifact (`row_count_volume` reports 0 and "fails"
+  locally because local bronze's newest `created_date` is ~6 days behind
+  the `run_date - 2` day the check samples; against fresh S3 bronze in CI
+  it passes).
+
+### Idempotency + crash-safety — proven, not asserted
+
+The user required the append be idempotent **and** crash-safe, and asked
+which mechanism and for proof. **Both mechanisms, belt and suspenders:**
+1. *Idempotent by key*: today's rows are keyed on
+   `(check_name, grain, run_date)`; a re-run deletes-then-reinserts today's
+   rows (the CSV merge does `where (…) not in (select … from today)
+   union all by name select … from today`). A CI job that appends, then
+   fails a later step (Soda, dashboard verify) and is re-run, produces a
+   **byte-identical** file.
+2. *Crash-safe by atomic rename*: the CSV is never mutated in place. The
+   merged result is `COPY`'d to `scorecard_history.csv.tmp` in the same
+   directory, then `os.replace()`'d over the target (atomic on POSIX). A
+   crash mid-write leaves either the complete old file or the complete new
+   file. A stale `.tmp` from an earlier crash is overwritten by the next
+   `COPY`, never appended to.
+3. It also only runs *after* `dbt build` has fully succeeded (workflow step
+   order), so a failed build never touches history at all.
+
+Proof (`scratchpad/test_scorecard_history.py`, all assertions pass):
+
+| # | Check | Result |
+|---|---|---|
+| 1 | fresh create, then immediate re-run | sha256 identical; `today_rows_replaced_in_history == today_rows` |
+| 2 | a hand-built 2-day file, then merge today | both `run_date`s survive; `merged_rows == 2 x snapshot` |
+| 3 | `os.replace` monkeypatched to raise mid-run | original file byte-identical afterward, still valid CSV, readable |
+| 4 | a stale `.tmp` full of garbage left on disk, then run | result valid, `"GARBAGE"` never appears in the CSV, `.tmp` gone |
+| 5 | a row dated 237 days before today in the input | `dropped_by_retention == 1`; that `run_date` absent from output |
+
+### Bounded — the 180-day cap
+
+Taken (user's call), not for file size (~103 rows/day, a few MB/year) but
+because an unbounded append-only file on a public portfolio repo "reads as
+unconsidered." `RETENTION_DAYS = 180` in the script: rows with
+`run_date < today - 180d` are dropped on each merge. 180 exceeds every
+detector's own lookback window and covers a quarter-plus of daily trend.
+
+### `--full-refresh` — enforced-off in CI, not just documented
+
+The user's second requirement: a `dbt build --full-refresh` in CI would
+re-scan all 808 S3 bronze objects (~140s/table-model, C6.4) and — before
+this Variant-B change — would also have wiped the incremental scorecard's
+base. Constraint added to the C6.4 list; **and enforced**, because "every
+other documented-but-unenforced constraint in this project eventually got
+tested by accident" (partial-parse, `is_settled`, the session timezone).
+
+`scripts/dbt_guard.sh` (new): the wrapper every CI `dbt` call now goes
+through (`build_and_quality.yml` calls `../scripts/dbt_guard.sh build …`
+and `… source freshness …`, never `dbt` directly). It exits `2` with a
+`::error::` annotation *before dbt starts* if it sees `--full-refresh`
+(any `=value` form), `-f`, or `DBT_FULL_REFRESH` truthy in the env; a
+clean invocation is `exec`'d straight through to `.venv/bin/dbt`. Local
+dev is unaffected — developers run `dbt` directly. Verified: all three
+forbidden forms exit 2; `--version` and a normal `build` pass through.
+
+**Constraint-table addition (belongs with phase-6.md's "constraints that
+must all hold at once"):**
+
+| Constraint | Source | Consequence if ignored |
+|---|---|---|
+| **Never `dbt … --full-refresh` in CI** | C6.4 | Full re-scan of all S3 bronze objects (~140s/model); historically also destroyed incremental state. Enforced by `scripts/dbt_guard.sh` (exit 2 before dbt runs). |
+
+## C6.5 — Dashboard refresh in CI
+
+The dashboard refresh runs as **later steps in the `build_and_quality`
+job**, not a separate workflow, because `scripts/build_dashboard_source.py`
+reads the ~600MB `dbt/target/openledger_prod.duckdb` this job's `dbt build`
+just produced. Handing that to a separate job means an
+`upload-artifact`/`download-artifact` round trip of the whole file — the
+same "move a large blob to move a small delta" cost C6.1 rejected for
+bronze, and here there isn't even a cheaper alternative (the file is this
+run's own ephemeral output, not accumulated state). Same-job steps reading
+it straight off the runner's disk are strictly cheaper with no correctness
+downside.
+
+**Redeploy trigger: a git push, no deploy-hook call.** Vercel's git
+integration rebuilds the Evidence.dev static site on every push to `main`
+(proven in Phase 5, C5.8). The `build_and_quality` job commits the rebuilt
+pruned source (`dashboard/sources/openledger/openledger.duckdb`) **and**
+the appended `state/scorecard_history.csv` in one push; that push is the
+trigger.
+
+**No data-change gate on the push.** C5.8 already established that the
+pruned DuckDB's bytes differ on every rebuild regardless of content, so a
+byte/hash diff is not a meaningful signal — gating on it would add
+complexity to *skip* an operation (a Vercel static rebuild) that is
+already free and fast. The real signal that the refresh should happen is
+that the pipeline reached this step at all: ingest + build + every quality
+gate passed. phase-6.md floated "a deploy hook fired only when a
+meaningful metric changed" as an alternative — rejected for that reason:
+the hook adds a moving part and a decision ("which metric? what delta?")
+to avoid a rebuild that costs nothing.
+
+**Deploy verification, not fire-and-forget.** After the push, the job
+polls `https://openledger-three.vercel.app/` up to 12x/10s and greps for
+`OpenLedger`; if the site never comes back as a real OpenLedger page the
+job fails with `::error::`. This is a liveness/identity check only —
+"the dashboard re-rendered with *correct data*" is H6.3's job (a human
+watching the first real scheduled run), matching phase-6.md's own division
+of labor. A fire-and-forget push with no check could fail silently if a
+Vercel build breaks.
+
+**Scorecard trend now visible.** With history in the committed CSV, the
+data-quality page gained two small line charts (checks-not-passing and
+pass-rate-% by `run_date`) — see the C6.4 follow-up above for the full set
+of changes.
+
+## C6.6 — Failure behaviour and notification
+
+**Notification: GitHub-native email on a failed run. No extra service** —
+matches CLAUDE.md's standing decision. The repo owner enables Settings →
+Notifications → Actions → "failed workflows only" (a HUMAN-ONLY setting;
+listed for H6.2). Both workflows additionally write a `$GITHUB_STEP_SUMMARY`
+block on `failure()` so the first thing visible from that email — the run
+summary — names the failing stage and, for ingest, *which class* of
+failure it was.
+
+**Two failure classes in the ingest workflow, kept distinguishable:**
+- *Infra / pipeline error* (Socrata fetch, S3 write, credentials): the
+  `run_ingest_ci.py` step itself exits nonzero. The "Commit updated state"
+  step is `if: success()` so it is skipped — watermark/checkpoint/staleness
+  in git are never advanced past an unconfirmed S3 write (C6.1 req 6 at the
+  git layer). Job is red; summary says "state was NOT advanced, re-running
+  is safe".
+- *Staleness alarm*: the ingest step exits **0** (the run genuinely
+  succeeded or correctly short-circuited) and its outcome **is** committed.
+  A separate later step, gated on `steps.ingest.outputs.alarm == 'true'`,
+  exits 1 purely to turn the job red for this specific reason. Summary
+  says "not an infra failure — state WAS committed".
+
+**Consecutive-short-circuit alerting (phase-6.md C6.6: "define the
+threshold from Phase 3's reasoning, and wire it").**
+
+Threshold = **2**, the same `STALENESS_ALARM_THRESHOLD` and the same Phase
+3 reasoning as C6.2: at a daily cron and ~11,905 rows/day steady state
+with a near-daily mass-touch, one quiet day fits the observed
+publish-lag distribution (the New Year's low week is documented
+precedent); two consecutive do not. Threshold 1 false-alarms on every
+ordinary single-day lag; 3+ lets a real outage sit an extra cycle.
+
+**Wiring — one alarm, two nested counters.** `ingest/checkpoint.py`'s
+`record_run_outcome(advanced, short_circuited=False)` now maintains:
+- `consecutive_no_advance` — runs where the watermark did not move for
+  *any* reason (a real fetch that returned nothing newer, **or** a no-op
+  short-circuit). This is the alarm signal, unchanged from C6.2.
+- `consecutive_short_circuits` — runs that short-circuited (query window
+  byte-identical to the previous run, so no Socrata query issued). A
+  **strict subset** of `no_advance`. Tracked separately as a *diagnostic*,
+  not gated on a second threshold — a separate threshold on a subset would
+  answer the same operational question ("is data still flowing?").
+
+The alarm message (`ingest/pipeline.py: _staleness_alarm_message`) reads
+the two counters and self-classifies:
+- `short_circuits == no_advance` → "the query window has not changed
+  between runs (frozen watermark/boundary, or the source has genuinely
+  stopped publishing)".
+- `short_circuits == 0` while `no_advance` climbs → "queries ran and
+  returned rows on each, but none newer than the stored watermark (source
+  republishing stale data, or a watermark-compare bug)".
+
+Both counters reset to 0 on any genuine watermark advance. `run_ingest_ci.py`
+emits both to `$GITHUB_OUTPUT`; the ingest workflow's alarm step and the
+failure summary both surface `consecutive_short_circuits`. Verified live
+against an isolated staleness file: two consecutive short-circuits trip the
+alarm with the "window has not changed" message; two real no-advance runs
+trip it with the "nothing newer than the watermark" message; an advance
+resets both.

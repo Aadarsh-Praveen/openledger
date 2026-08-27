@@ -1,0 +1,360 @@
+{
+  "windows": {
+    "2026-05": {
+      "start": "2026-05-01T00:00:00.000",
+      "end": "2026-06-01T00:00:00.000",
+      "status": "complete",
+      "started_at": "2026-08-20T01:22:36.364129+00:00",
+      "rows_fetched": 331978,
+      "expected_count": 331978,
+      "count_matched": true,
+      "watermark_high": "2026-08-19T01:33:23.553000+00:00",
+      "completed_at": "2026-08-20T01:25:25.450794+00:00"
+    },
+    "2026-06": {
+      "start": "2026-06-01T00:00:00.000",
+      "end": "2026-07-01T00:00:00.000",
+      "status": "complete",
+      "started_at": "2026-08-20T01:26:26.504186+00:00",
+      "rows_fetched": 334833,
+      "expected_count": 334833,
+      "count_matched": true,
+      "watermark_high": "2026-08-19T01:33:23.553000+00:00",
+      "completed_at": "2026-08-20T01:30:22.989372+00:00"
+    },
+    "2024-08": {
+      "start": "2024-08-19T00:00:00.000",
+      "end": "2024-09-01T00:00:00.000",
+      "status": "complete",
+      "started_at": "2026-08-20T03:59:22.824733+00:00",
+      "rows_fetched": 119270,
+      "expected_count": 119270,
+      "count_matched": true,
+      "watermark_high": "2026-08-20T01:33:14.813000+00:00",
+      "completed_at": "2026-08-20T04:00:30.815768+00:00"
+    },
+    "2024-09": {
+      "start": "2024-09-01T00:00:00.000",
+      "end": "2024-10-01T00:00:00.000",
+      "status": "complete",
+      "started_at": "2026-08-20T04:00:30.816886+00:00",
+      "rows_fetched": 306770,
+      "expected_count": 306770,
+      "count_matched": true,
+      "watermark_high": "2026-08-20T01:33:14.813000+00:00",
+      "completed_at": "2026-08-20T04:03:08.982104+00:00"
+    },
+    "2024-10": {
+      "start": "2024-10-01T00:00:00.000",
+      "end": "2024-11-01T00:00:00.000",
+      "status": "complete",
+      "started_at": "2026-08-20T04:03:08.983211+00:00",
+      "rows_fetched": 306803,
+      "expected_count": 306803,
+      "count_matched": true,
+      "watermark_high": "2026-08-20T01:33:14.813000+00:00",
+      "completed_at": "2026-08-20T04:04:31.941834+00:00"
+    },
+    "2024-11": {
+      "start": "2024-11-01T00:00:00.000",
+      "end": "2024-12-01T00:00:00.000",
+      "status": "complete",
+      "started_at": "2026-08-20T04:04:31.943001+00:00",
+      "rows_fetched": 293515,
+      "expected_count": 293515,
+      "count_matched": true,
+      "watermark_high": "2026-08-20T01:33:14.813000+00:00",
+      "completed_at": "2026-08-20T04:07:26.708500+00:00"
+    },
+    "2024-12": {
+      "start": "2024-12-01T00:00:00.000",
+      "end": "2025-01-01T00:00:00.000",
+      "status": "complete",
+      "started_at": "2026-08-20T04:07:26.709664+00:00",
+      "rows_fetched": 313949,
+      "expected_count": 313949,
+      "count_matched": true,
+      "watermark_high": "2026-08-20T01:33:14.813000+00:00",
+      "completed_at": "2026-08-20T04:09:17.448731+00:00"
+    },
+    "2025-01": {
+      "start": "2025-01-01T00:00:00.000",
+      "end": "2025-02-01T00:00:00.000",
+      "status": "complete",
+      "started_at": "2026-08-20T04:09:17.449411+00:00",
+      "rows_fetched": 348180,
+      "expected_count": 348180,
+      "count_matched": true,
+      "watermark_high": "2026-08-20T01:33:14.813000+00:00",
+      "completed_at": "2026-08-20T04:11:51.552154+00:00"
+    },
+    "2025-02": {
+      "start": "2025-02-01T00:00:00.000",
+      "end": "2025-03-01T00:00:00.000",
+      "status": "complete",
+      "started_at": "2026-08-20T04:11:51.553444+00:00",
+      "rows_fetched": 255364,
+      "expected_count": 255364,
+      "count_matched": true,
+      "watermark_high": "2026-08-20T01:33:14.813000+00:00",
+      "completed_at": "2026-08-20T04:13:48.992266+00:00"
+    },
+    "2025-03": {
+      "start": "2025-03-01T00:00:00.000",
+      "end": "2025-04-01T00:00:00.000",
+      "status": "complete",
+      "started_at": "2026-08-20T04:13:48.993217+00:00",
+      "rows_fetched": 281221,
+      "expected_count": 281221,
+      "count_matched": true,
+      "watermark_high": "2026-08-20T01:33:14.813000+00:00",
+      "completed_at": "2026-08-20T04:15:41.239786+00:00"
+    },
+    "2025-04": {
+      "start": "2025-04-01T00:00:00.000",
+      "end": "2025-05-01T00:00:00.000",
+      "status": "complete",
+      "started_at": "2026-08-20T04:15:41.241147+00:00",
+      "rows_fetched": 272549,
+      "expected_count": 272549,
+      "count_matched": true,
+      "watermark_high": "2026-08-20T01:33:14.813000+00:00",
+      "completed_at": "2026-08-20T04:17:32.847349+00:00"
+    },
+    "2025-05": {
+      "start": "2025-05-01T00:00:00.000",
+      "end": "2025-06-01T00:00:00.000",
+      "status": "complete",
+      "started_at": "2026-08-20T04:17:32.848368+00:00",
+      "rows_fetched": 295057,
+      "expected_count": 295057,
+      "count_matched": true,
+      "watermark_high": "2026-08-20T01:33:14.813000+00:00",
+      "completed_at": "2026-08-20T04:19:49.367341+00:00"
+    },
+    "2025-06": {
+      "start": "2025-06-01T00:00:00.000",
+      "end": "2025-07-01T00:00:00.000",
+      "status": "complete",
+      "started_at": "2026-08-20T04:19:49.369109+00:00",
+      "rows_fetched": 306442,
+      "expected_count": 306442,
+      "count_matched": true,
+      "watermark_high": "2026-08-20T01:33:14.813000+00:00",
+      "completed_at": "2026-08-20T04:22:26.394443+00:00"
+    },
+    "2025-07": {
+      "start": "2025-07-01T00:00:00.000",
+      "end": "2025-08-01T00:00:00.000",
+      "status": "complete",
+      "started_at": "2026-08-20T04:22:26.395484+00:00",
+      "rows_fetched": 315883,
+      "expected_count": 315883,
+      "count_matched": true,
+      "watermark_high": "2026-08-20T01:33:14.813000+00:00",
+      "completed_at": "2026-08-20T04:25:30.542883+00:00"
+    },
+    "2025-08": {
+      "start": "2025-08-01T00:00:00.000",
+      "end": "2025-09-01T00:00:00.000",
+      "status": "complete",
+      "started_at": "2026-08-20T04:25:30.544090+00:00",
+      "rows_fetched": 304039,
+      "expected_count": 304039,
+      "count_matched": true,
+      "watermark_high": "2026-08-20T01:33:14.813000+00:00",
+      "completed_at": "2026-08-20T04:27:52.601482+00:00"
+    },
+    "2025-09": {
+      "start": "2025-09-01T00:00:00.000",
+      "end": "2025-10-01T00:00:00.000",
+      "status": "complete",
+      "started_at": "2026-08-20T04:27:52.602820+00:00",
+      "rows_fetched": 302684,
+      "expected_count": 302684,
+      "count_matched": true,
+      "watermark_high": "2026-08-20T01:33:14.813000+00:00",
+      "completed_at": "2026-08-20T04:29:36.421010+00:00"
+    },
+    "2025-10": {
+      "start": "2025-10-01T00:00:00.000",
+      "end": "2025-11-01T00:00:00.000",
+      "status": "complete",
+      "started_at": "2026-08-20T04:29:36.422097+00:00",
+      "rows_fetched": 336612,
+      "expected_count": 336612,
+      "count_matched": true,
+      "watermark_high": "2026-08-20T01:33:14.813000+00:00",
+      "completed_at": "2026-08-20T04:32:12.025273+00:00"
+    },
+    "2025-11": {
+      "start": "2025-11-01T00:00:00.000",
+      "end": "2025-12-01T00:00:00.000",
+      "status": "complete",
+      "started_at": "2026-08-20T04:32:12.026720+00:00",
+      "rows_fetched": 304905,
+      "expected_count": 304905,
+      "count_matched": true,
+      "watermark_high": "2026-08-20T01:33:14.813000+00:00",
+      "completed_at": "2026-08-20T04:35:14.213562+00:00"
+    },
+    "2025-12": {
+      "start": "2025-12-01T00:00:00.000",
+      "end": "2026-01-01T00:00:00.000",
+      "status": "complete",
+      "started_at": "2026-08-20T04:35:14.214648+00:00",
+      "rows_fetched": 332103,
+      "expected_count": 332103,
+      "count_matched": true,
+      "watermark_high": "2026-08-20T01:33:14.813000+00:00",
+      "completed_at": "2026-08-20T04:37:45.821638+00:00"
+    },
+    "2026-01": {
+      "start": "2026-01-01T00:00:00.000",
+      "end": "2026-02-01T00:00:00.000",
+      "status": "complete",
+      "started_at": "2026-08-20T04:37:45.822493+00:00",
+      "rows_fetched": 348511,
+      "expected_count": 348511,
+      "count_matched": true,
+      "watermark_high": "2026-08-20T01:33:14.813000+00:00",
+      "completed_at": "2026-08-20T04:41:34.817569+00:00"
+    },
+    "2026-02": {
+      "start": "2026-02-01T00:00:00.000",
+      "end": "2026-03-01T00:00:00.000",
+      "status": "complete",
+      "started_at": "2026-08-20T04:41:34.818584+00:00",
+      "rows_fetched": 334690,
+      "expected_count": 334690,
+      "count_matched": true,
+      "watermark_high": "2026-08-20T01:33:14.813000+00:00",
+      "completed_at": "2026-08-20T04:44:23.271809+00:00"
+    },
+    "2026-03": {
+      "start": "2026-03-01T00:00:00.000",
+      "end": "2026-04-01T00:00:00.000",
+      "status": "complete",
+      "started_at": "2026-08-20T04:44:23.273293+00:00",
+      "rows_fetched": 342387,
+      "expected_count": 342387,
+      "count_matched": true,
+      "watermark_high": "2026-08-20T01:33:14.813000+00:00",
+      "completed_at": "2026-08-20T04:47:03.752652+00:00"
+    },
+    "2026-04": {
+      "start": "2026-04-01T00:00:00.000",
+      "end": "2026-05-01T00:00:00.000",
+      "status": "complete",
+      "started_at": "2026-08-20T04:47:03.754677+00:00",
+      "rows_fetched": 302190,
+      "expected_count": 302190,
+      "count_matched": true,
+      "watermark_high": "2026-08-20T01:33:14.813000+00:00",
+      "completed_at": "2026-08-20T04:48:58.117847+00:00"
+    },
+    "2026-07": {
+      "start": "2026-07-01T00:00:00.000",
+      "end": "2026-08-01T00:00:00.000",
+      "status": "complete",
+      "started_at": "2026-08-20T04:48:58.119698+00:00",
+      "rows_fetched": 342895,
+      "expected_count": 342895,
+      "count_matched": true,
+      "watermark_high": "2026-08-20T01:58:51.619000+00:00",
+      "completed_at": "2026-08-20T04:51:07.815067+00:00"
+    },
+    "2026-08": {
+      "start": "2026-08-01T00:00:00.000",
+      "end": "2026-08-20T03:59:22.698",
+      "status": "complete",
+      "started_at": "2026-08-20T04:51:07.816632+00:00",
+      "rows_fetched": 189242,
+      "expected_count": 189242,
+      "count_matched": true,
+      "watermark_high": "2026-08-20T02:23:09.123000+00:00",
+      "completed_at": "2026-08-20T04:53:07.008273+00:00"
+    },
+    "incremental_2026-08-20": {
+      "start": "2026-08-18T02:23:09.123000",
+      "end": "2026-08-20T03:00:00",
+      "status": "complete",
+      "started_at": "2026-08-20T17:18:14.190035+00:00",
+      "rows_fetched": 546445,
+      "expected_count": 546445,
+      "count_matched": true,
+      "watermark_high": "2026-08-20T02:23:09.123000+00:00",
+      "completed_at": "2026-08-20T17:33:32.427688+00:00"
+    },
+    "incremental_20260820T185109918200": {
+      "start": "2026-08-18T02:23:09.123000",
+      "end": "2026-08-20T03:00:00",
+      "status": "skipped_no_new_window",
+      "reason": "Window [2026-08-18T02:23:09.123000, 2026-08-20T03:00:00) is identical to the most recent incremental run (incremental_2026-08-20) \u2014 no new publish cycle since then.",
+      "skipped_at": "2026-08-20T18:51:09.918266+00:00"
+    },
+    "incremental_20260820T185109925821": {
+      "start": "2026-08-18T02:23:09.123000",
+      "end": "2026-08-20T03:00:00",
+      "status": "skipped_no_new_window",
+      "reason": "Window [2026-08-18T02:23:09.123000, 2026-08-20T03:00:00) is identical to the most recent incremental run (incremental_20260820T185109918200) \u2014 no new publish cycle since then.",
+      "skipped_at": "2026-08-20T18:51:09.925877+00:00"
+    },
+    "incremental_20260820T190942694851": {
+      "start": "2026-08-18T02:23:09.123000",
+      "end": "2026-08-20T03:00:00",
+      "status": "skipped_no_new_window",
+      "reason": "Window [2026-08-18T02:23:09.123000, 2026-08-20T03:00:00) is identical to the most recent incremental run (incremental_20260820T185109925821) \u2014 no new publish cycle since then.",
+      "skipped_at": "2026-08-20T19:09:42.694946+00:00"
+    },
+    "incremental_20260821T142427947747": {
+      "start": "2026-08-18T02:23:09.123000",
+      "end": "2026-08-21T03:00:00",
+      "status": "complete",
+      "started_at": "2026-08-21T14:24:27.950957+00:00",
+      "rows_fetched": 559540,
+      "expected_count": 559540,
+      "count_matched": true,
+      "watermark_high": "2026-08-21T02:49:13.094000+00:00",
+      "completed_at": "2026-08-21T14:46:46.674490+00:00"
+    },
+    "incremental_20260821T144839069673": {
+      "start": "2026-08-19T02:49:13.094000",
+      "end": "2026-08-21T03:00:00",
+      "status": "complete",
+      "started_at": "2026-08-21T14:48:39.070144+00:00",
+      "rows_fetched": 545988,
+      "expected_count": 545988,
+      "count_matched": true,
+      "watermark_high": "2026-08-21T02:49:13.094000+00:00",
+      "completed_at": "2026-08-21T15:12:52.127261+00:00"
+    },
+    "incremental_20260826T212430253818": {
+      "start": "2026-08-19T02:49:13.094000",
+      "end": "2026-08-26T03:00:00",
+      "status": "abandoned",
+      "started_at": "2026-08-26T21:24:30.254884+00:00",
+      "abandoned_at": "2026-08-26T23:00:59.632617+00:00",
+      "reason": "Interrupted by a genuine Socrata read timeout mid-run (C6.3 live S3 test). scoped_upsert commits atomically per call, so any partial rows written are re-matched as no-ops by the superseding run. Same window was completed successfully by incremental_20260826T222322511588; this entry is retained as a forensic record and is ignored by get_latest_incremental_entry() (status not in complete/skipped_no_new_window)."
+    },
+    "incremental_20260826T214230491451": {
+      "start": "2026-08-19T02:49:13.094000",
+      "end": "2026-08-26T03:00:00",
+      "status": "abandoned",
+      "started_at": "2026-08-26T21:42:30.493272+00:00",
+      "abandoned_at": "2026-08-26T23:00:59.632617+00:00",
+      "reason": "Interrupted by a genuine Socrata read timeout mid-run (C6.3 live S3 test). scoped_upsert commits atomically per call, so any partial rows written are re-matched as no-ops by the superseding run. Same window was completed successfully by incremental_20260826T222322511588; this entry is retained as a forensic record and is ignored by get_latest_incremental_entry() (status not in complete/skipped_no_new_window)."
+    },
+    "incremental_20260826T222322511588": {
+      "start": "2026-08-19T02:49:13.094000",
+      "end": "2026-08-26T03:00:00",
+      "status": "complete",
+      "started_at": "2026-08-26T22:23:22.512305+00:00",
+      "rows_fetched": 609998,
+      "expected_count": 609998,
+      "count_matched": true,
+      "watermark_high": "2026-08-26T01:46:10.547000+00:00",
+      "completed_at": "2026-08-26T23:00:59.632617+00:00"
+    }
+  }
+}

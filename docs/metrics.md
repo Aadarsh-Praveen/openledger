@@ -484,3 +484,38 @@ source rebuilt, committed, pushed — the push alone triggered Vercel's
 auto-redeploy (git integration, no manual deploy-hook call needed) — and
 the live site was independently re-fetched afterward to confirm it still
 rendered the same reconciled figures (7,533,132 / 96.4% / 8h).
+
+## Phase 6 (GitHub Actions orchestration; C6.1-C6.4 numbers, 2026-08-26)
+
+**S3 seed (C6.1, one-time)**: 7,533,132 rows, 25 monthly batches, **143s**,
+808 S3 objects / 740,842,401 bytes (~740MB — smaller than local's 1.7GB;
+a clean append history carries none of the superseded-file waste local
+bronze accumulated). Storage cost: **~$0.017/month**.
+
+**First live incremental run against S3-native bronze (C6.3, a real
+5-day catch-up — not steady-state volume; see below)**: 609,998 rows
+fetched, 104,899 updated, 55,099 inserted, 450,000 no-op, **count_matched
+= true**. Watermark advanced 2026-08-21T02:49 → 2026-08-26T01:46 UTC.
+Two prior attempts at this same window were interrupted by genuine
+Socrata read timeouts (external, not a bug) partway through; each
+`scoped_upsert` call had already committed atomically and independently,
+so those partial rows (69 total) were correctly re-matched as no-ops by
+this final run rather than duplicated — full reconciliation: 7,533,132
+(seed) + 69 (partial, pre-existing) + 55,099 (this run's genuine inserts)
+= **7,588,300**, exact match to the S3 table's actual row count after the
+run. A real correctness bug in `get_latest_incremental_entry()` (present
+since Phase 1, never triggered until this crash) was found and fixed in
+the process — see `docs/decisions.md`, C6.3.
+
+**S3 read latency vs. local disk (C6.4), measured, not assumed**: `dbt
+run` (13 models, no tests) against the S3-native table: **137.68s**,
+vs. **13.20s** for the equivalent full `dbt build` (models + 73 tests)
+against local bronze — roughly **10x** slower for the model layer alone.
+The four table-materialized models that actually scan/aggregate bronze
+dominate: `dim_agency` 28.25s, `dim_complaint_type` 16.93s, `dim_location`
+17.01s, `fct_service_requests` 67.60s. View models and the five
+pre-aggregated detectors are near their local timings (<1.5s each). At
+real daily cadence the per-run catch-up is ~1-3 days of data, not the
+5-day backlog this session's numbers reflect — steady-state duration
+should be considerably lower than either figure above, but is not yet
+measured for real (no scheduled run has happened yet; see C6.7/H6.3).

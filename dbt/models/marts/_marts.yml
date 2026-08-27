@@ -205,13 +205,15 @@ models:
   - name: fct_data_quality_checks
     description: >
       C3.6 — the DQ scorecard. Grain: one row per (check_name, grain,
-      run_date). Incremental so history accumulates across runs (trend,
-      not just current state). Four categories: contract, unit,
-      distributional, detector — see the model's own docstring for how
-      each is computed. Not contract-enforced: measured_value's meaning is
-      category-dependent by design (a rate, a row count, a delta in
-      percentage points), which a single enforced numeric type can't
-      usefully constrain further than "is a double."
+      run_date). Emits only the current run's snapshot; cross-run history
+      lives in state/scorecard_history.csv (C6.5 — the marts DuckDB is not
+      persisted between CI runs, so an incremental model here would lose
+      every prior day). Four categories: contract, unit, distributional,
+      detector — see the model's own docstring for how each is computed.
+      Not contract-enforced: measured_value's meaning is category-dependent
+      by design (a rate, a row count, a delta in percentage points), which
+      a single enforced numeric type can't usefully constrain further than
+      "is a double."
     columns:
       - name: check_name
         data_tests:

@@ -26,6 +26,13 @@ vars:
   # paths) — update this if the repo is ever moved or cloned elsewhere. Used by
   # macros/bronze_scan.sql, the one place the iceberg_scan()/version-guessing/
   # table-root quirk lives (see docs/decisions.md, C2.2).
+  #
+  # C6.4: dbt_project.yml `vars:` values are NOT re-rendered as Jinja when
+  # read back via var() (verified live: an env_var() call written here reached
+  # compiled SQL as literal unrendered text, not its resolved value) — so the
+  # CI override lives at the two iceberg_scan() call sites instead (env_var()
+  # IS rendered correctly there), not here. This value stays the plain local
+  # default, used whenever BRONZE_WAREHOUSE_ROOT is unset.
   bronze_warehouse_root: "/Users/aadarsh_praveen/Documents/Projects/Personal_Projects/OpenLedger/openledger/warehouse/bronze/service_requests"
 
   # Dev-time row limit: applied only in staging (C2.4), never bakes into the
